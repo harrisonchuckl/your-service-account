@@ -5,7 +5,6 @@ from .config import BAD_HOSTS, DEFAULT_LOCATION
 
 logger = get_logger("search")
 
-# Google Programmable Search (Custom Search JSON API)
 GOOGLE_CSE_KEY = os.getenv("GOOGLE_CSE_KEY")
 GOOGLE_CSE_CX  = os.getenv("GOOGLE_CSE_CX")
 GOOGLE_ENDPOINT = "https://www.googleapis.com/customsearch/v1"
@@ -34,6 +33,47 @@ def find_official_site(company, domain_hint):
     logger.info(f"[{company}] No search provider configured or no result.")
     return None
 
+def google_contact_hunt(company, location=None, domain_for_site=None, limit=4):
+    """
+    Return up to `limit` URLs likely to show an email/contact.
+    Prefer site-scoped queries if we know the domain.
+    """
+    if not (GOOGLE_CSE_KEY and GOOGLE_CSE_CX):
+        return []
+    loc = location or DEFAULT_LOCATION
+    queries = []
+
+    # site-scoped first if we know the domain
+    if domain_for_site:
+        queries += [
+            f'site:{domain_for_site} "@{domain_for_site}"',
+            f"site:{domain_for_site} contact",
+            f"site:{domain_for_site} email",
+            f'site:{domain_for_site} "contact us"',
+            f"site:{domain_for_site} privacy",
+        ]
+
+    # general with locality
+    queries += [
+        f"{company} {loc} email",
+        f"{company} {loc} contact",
+        f"{company} email address",
+        f"{company} contact details",
+    ]
+
+    urls = []
+    for q in queries:
+        items = _google_search(q, 5)
+        for it in items:
+            url = (it.get("link") or "").strip()
+            if url and looks_like_candidate(url):
+                urls.append(url)
+            if len(urls) >= limit:
+                return dedupe(urls)
+    return dedupe(urls)
+
+# ---- helpers ----
+
 def _google_first_good_url(query):
     items = _google_search(query, 5)
     for it in items:
@@ -41,28 +81,6 @@ def _google_first_good_url(query):
         if looks_like_official(url):
             return normalize_site(url)
     return None  # don't pick a random bad host
-
-def google_contact_hunt(company, location=None, limit=3):
-    """Return a few web URLs likely to contain an email/contact for this company."""
-    if not (GOOGLE_CSE_KEY and GOOGLE_CSE_CX):
-        return []
-    loc = location or DEFAULT_LOCATION
-    queries = [
-        f"{company} {loc} email",
-        f"{company} {loc} contact",
-        f"{company} email address",
-        f"{company} contact details",
-    ]
-    urls = []
-    for q in queries:
-        items = _google_search(q, 5)
-        for it in items:
-            url = (it.get("link") or "").strip()
-            if url and looks_like_contact_candidate(url):
-                urls.append(url)
-            if len(urls) >= limit:
-                return dedupe(urls)
-    return dedupe(urls)
 
 def _google_search(query, num=5):
     params = {"key": GOOGLE_CSE_KEY, "cx": GOOGLE_CSE_CX, "q": query, "num": num, "safe": "off"}
@@ -74,11 +92,12 @@ def looks_like_official(url):
     u = (url or "").lower()
     return bool(u) and not any(b in u for b in BAD_HOSTS)
 
-def looks_like_contact_candidate(url):
+def looks_like_candidate(url):
     u = (url or "").lower()
     if not u or any(b in u for b in BAD_HOSTS):
         return False
-    return any(x in u for x in ["contact", "about", "privacy", "impressum", "imprint"]) or True
+    # Anything on the same site or typical contact pages
+    return any(x in u for x in ["contact", "about", "privacy", "impressum", "imprint", "@"])
 
 def normalize_site(url):
     ext = tldextract.extract(url or "")
