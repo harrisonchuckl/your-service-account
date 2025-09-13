@@ -14,6 +14,8 @@ def run():
     rows = sheet.read_rows(ws)
 
     processed = 0
+    writes = 0
+
     for i, row in enumerate(rows, start=2):  # data starts at row 2
         if processed >= MAX_ROWS:
             break
@@ -30,11 +32,19 @@ def run():
         if not website:
             website = search.find_official_site(company, domain_hint)
             if not website:
+                # Still write a status so you can see it was attempted
                 sheet.write_result(ws, i, {
                     "Status": "NoWebsiteFound",
-                    "Notes": "Search yielded no official site"
+                    "Notes": "Search provider not configured or no result"
                 })
+                writes += 1
                 processed += 1
+
+                # gentle throttling: every 25 writes, pause ~65s
+                if writes % 25 == 0:
+                    time.sleep(65)
+                else:
+                    time.sleep(1.2)
                 continue
 
         try:
@@ -55,9 +65,14 @@ def run():
                 "Notes": str(e)
             })
 
+        writes += 1
         processed += 1
-        time.sleep(1.0)  # be polite
+
+        # throttle to avoid Google's per-minute write limit
+        if writes % 25 == 0:
+            time.sleep(65)
+        else:
+            time.sleep(1.2)
 
 if __name__ == "__main__":
     run()
-
