@@ -49,6 +49,9 @@ def ensure_headers(ws):
         ws.update("A1", [HEADERS])
 
 def write_result(ws, row_idx_1_based, result: dict):
+    """
+    Writes columns C..I (Website..Notes) and updates LastChecked (H).
+    """
     values = [
         result.get("Website", ""),
         result.get("ContactEmail", ""),
@@ -58,4 +61,5 @@ def write_result(ws, row_idx_1_based, result: dict):
         datetime.datetime.utcnow().isoformat(),
         result.get("Notes", "")
     ]
+    # IMPORTANT: this must be a real f-string like below (no asterisks around the variable name)
     ws.update(range_name=f"C{row_idx_1_based}:I{row_idx_1_based}", values=[values])
