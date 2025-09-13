@@ -12,12 +12,14 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@v4
+
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+
       - run: pip install -r requirements.txt
 
-      # Safe validator: does NOT print your secret, only tells if it's valid raw JSON or base64 JSON
+      # Safety check: validates your GOOGLE_SA_JSON_B64 secret without printing it
       - name: Validate GOOGLE_SA_JSON_B64 (no content leak)
         env:
           GOOGLE_SA_JSON_B64: ${{ secrets.GOOGLE_SA_JSON_B64 }}
@@ -49,7 +51,10 @@ jobs:
           GOOGLE_SA_JSON_B64: ${{ secrets.GOOGLE_SA_JSON_B64 }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
           SHEET_TAB: "Sheet1"
-          MAX_ROWS: "500"
+          MAX_ROWS: "30"                      # keep low while testing
+          GOOGLE_CSE_KEY: ${{ secrets.GOOGLE_CSE_KEY }}
+          GOOGLE_CSE_CX:  ${{ secrets.GOOGLE_CSE_CX }}
+          # optional fallbacks:
           BING_API_KEY: ${{ secrets.BING_API_KEY }}
           SCRAPERAPI_KEY: ${{ secrets.SCRAPERAPI_KEY }}
         run: python -m src.main
