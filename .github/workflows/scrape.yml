@@ -1,0 +1,49 @@
+name: Scrape Contacts
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "15 7 * * *"   # 07:15 UTC daily
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - run: pip install -r requirements.txt
+
+      # Safety check: validates your GOOGLE_SA_JSON_B64 secret without printing it
+      - name: Validate GOOGLE_SA_JSON_B64 (no content leak)
+        env:
+          GOOGLE_SA_JSON_B64: ${{ secrets.GOOGLE_SA_JSON_B64 }}
+        run: |
+          python - <<'PY'
+          import os, base64, json, binascii, sys
+          s=os.environ.get('GOOGLE_SA_JSON_B64','').strip()
+          if not s:
+              print("❌ Secret missing or empty"); sys.exit(1)
+          if s[:1]=='{':
+              try:
+                  json.loads(s)
+                  print("✅ Secret looks like RAW JSON and parses OK.")
+              except json.JSONDecodeError as e:
+                  print("❌ RAW JSON present but invalid:", e); sys.exit(1)
+          else:
+              try:
+                  pad = (-len(s)) % 4
+                  s2 = s + ("="*pad)
+                  decoded = base64.b64decode(s2)
+                  json.loads(decoded)
+                  print("✅ Secret looks like BASE64 JSON and parses OK.")
+              except (binascii.Error, json.JSONDecodeError) as e:
+                  print("❌ Secret is neither raw JSON nor base64 JSON. Paste the ENTIRE service account JSON."); sys.exit(1)
+          PY
+
+      - name: Run scraper
