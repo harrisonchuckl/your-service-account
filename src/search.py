@@ -1,6 +1,7 @@
 import os
 import requests, tldextract
 from .logging_utils import get_logger
+from .config import BAD_HOSTS, DEFAULT_LOCATION
 
 logger = get_logger("search")
 
@@ -9,46 +10,33 @@ GOOGLE_CSE_KEY = os.getenv("GOOGLE_CSE_KEY")
 GOOGLE_CSE_CX  = os.getenv("GOOGLE_CSE_CX")
 GOOGLE_ENDPOINT = "https://www.googleapis.com/customsearch/v1"
 
-# Optional Bing fallback (only used if Google vars aren’t set)
-BING_API_KEY = os.getenv("BING_API_KEY")
-BING_ENDPOINT = os.getenv("BING_ENDPOINT") or "https://api.bing.microsoft.com/v7.0/search"
-
 def find_official_site(company, domain_hint):
-    # If you’ve filled the Domain column, prefer it.
+    """Try to find the company's official root site."""
     if domain_hint and "." in domain_hint:
         url = normalize_site(f"https://{domain_hint}")
         if url:
             logger.info(f"[{company}] Using domain hint: {url}")
             return url
 
-    # Try Google first (free 100/day)
     if GOOGLE_CSE_KEY and GOOGLE_CSE_CX:
-        u = _google_find(company)
-        if u:
-            logger.info(f"[{company}] Google resolved: {u}")
-            return u
-
-    # Optional fallback to Bing if configured
-    if BING_API_KEY:
-        u = _bing_find(company)
-        if u:
-            logger.info(f"[{company}] Bing resolved: {u}")
-            return u
+        # Try with location, then without
+        queries = [
+            f"{company} {DEFAULT_LOCATION} official site",
+            f"{company} {DEFAULT_LOCATION}",
+            f"{company} website",
+            f"{company}"
+        ]
+        for q in queries:
+            url = _google_first_good_url(q)
+            if url:
+                logger.info(f"[{company}] Google resolved: {url}")
+                return url
 
     logger.info(f"[{company}] No search provider configured or no result.")
     return None
 
-def _google_find(query):
-    params = {
-        "key": GOOGLE_CSE_KEY,
-        "cx": GOOGLE_CSE_CX,
-        "q": query,
-        "num": 5,
-        "safe": "off",
-    }
-    r = requests.get(GOOGLE_ENDPOINT, params=params, timeout=20)
-    r.raise_for_status()
-    items = (r.json() or {}).get("items", []) or []
+def _google_first_good_url(query):
+    items = _google_search(query, 5)
     for it in items:
         url = it.get("link") or it.get("formattedUrl") or ""
         if looks_like_official(url):
@@ -57,28 +45,58 @@ def _google_find(query):
         return normalize_site(items[0].get("link", ""))
     return None
 
-def _bing_find(query):
-    params = {"q": query, "count": 5, "responseFilter": "Webpages", "mkt": "en-GB"}
-    headers = {"Ocp-Apim-Subscription-Key": BING_API_KEY}
-    r = requests.get(BING_ENDPOINT, params=params, headers=headers, timeout=20)
+def google_contact_hunt(company, location=None, limit=3):
+    """
+    Return a few web URLs likely to contain an email/contact for this company.
+    We search general web with bias to the local area.
+    """
+    if not (GOOGLE_CSE_KEY and GOOGLE_CSE_CX):
+        return []
+
+    loc = location or DEFAULT_LOCATION
+    queries = [
+        f"{company} {loc} email",
+        f"{company} {loc} contact",
+        f"{company} email address",
+        f"{company} contact details",
+    ]
+    urls = []
+    for q in queries:
+        items = _google_search(q, 5)
+        for it in items:
+            url = (it.get("link") or "").strip()
+            if url and looks_like_contact_candidate(url):
+                urls.append(url)
+            if len(urls) >= limit:
+                return dedupe(urls)
+    return dedupe(urls)
+
+def _google_search(query, num=5):
+    params = {"key": GOOGLE_CSE_KEY, "cx": GOOGLE_CSE_CX, "q": query, "num": num, "safe": "off"}
+    r = requests.get(GOOGLE_ENDPOINT, params=params, timeout=20)
     r.raise_for_status()
-    items = r.json().get("webPages", {}).get("value", []) or []
-    for it in items:
-        url = it.get("url", "")
-        if looks_like_official(url):
-            return normalize_site(url)
-    if items:
-        return normalize_site(items[0].get("url", ""))
-    return None
+    return (r.json() or {}).get("items", []) or []
 
 def looks_like_official(url):
-    bad = ["facebook.com","twitter.com","x.com","linkedin.com","instagram.com",
-           "youtube.com","wikipedia.org","glassdoor.com"]
     u = (url or "").lower()
-    return bool(u) and not any(b in u for b in bad)
+    return bool(u) and not any(b in u for b in BAD_HOSTS)
+
+def looks_like_contact_candidate(url):
+    u = (url or "").lower()
+    if not u or any(b in u for b in BAD_HOSTS):
+        return False
+    # pages that often show emails / contact info
+    return any(x in u for x in ["contact", "about", "privacy", "impressum", "imprint"]) or True
 
 def normalize_site(url):
     ext = tldextract.extract(url or "")
     if not ext.registered_domain:
         return None
     return f"https://{ext.registered_domain}"
+
+def dedupe(seq):
+    out, seen = [], set()
+    for x in seq:
+        if x not in seen:
+            out.append(x); seen.add(x)
+    return out
