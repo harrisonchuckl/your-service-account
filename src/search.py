@@ -19,7 +19,6 @@ def find_official_site(company, domain_hint):
             return url
 
     if GOOGLE_CSE_KEY and GOOGLE_CSE_CX:
-        # Try with location, then without
         queries = [
             f"{company} {DEFAULT_LOCATION} official site",
             f"{company} {DEFAULT_LOCATION}",
@@ -41,18 +40,12 @@ def _google_first_good_url(query):
         url = it.get("link") or it.get("formattedUrl") or ""
         if looks_like_official(url):
             return normalize_site(url)
-    if items:
-        return normalize_site(items[0].get("link", ""))
-    return None
+    return None  # don't pick a random bad host
 
 def google_contact_hunt(company, location=None, limit=3):
-    """
-    Return a few web URLs likely to contain an email/contact for this company.
-    We search general web with bias to the local area.
-    """
+    """Return a few web URLs likely to contain an email/contact for this company."""
     if not (GOOGLE_CSE_KEY and GOOGLE_CSE_CX):
         return []
-
     loc = location or DEFAULT_LOCATION
     queries = [
         f"{company} {loc} email",
@@ -85,7 +78,6 @@ def looks_like_contact_candidate(url):
     u = (url or "").lower()
     if not u or any(b in u for b in BAD_HOSTS):
         return False
-    # pages that often show emails / contact info
     return any(x in u for x in ["contact", "about", "privacy", "impressum", "imprint"]) or True
 
 def normalize_site(url):
