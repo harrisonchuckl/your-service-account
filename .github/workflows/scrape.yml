@@ -47,14 +47,3 @@ jobs:
           PY
 
       - name: Run scraper
-        env:
-          GOOGLE_SA_JSON_B64: ${{ secrets.GOOGLE_SA_JSON_B64 }}
-          SHEET_ID: ${{ secrets.SHEET_ID }}
-          SHEET_TAB: "Sheet1"
-          MAX_ROWS: "30"                      # keep low while testing
-          GOOGLE_CSE_KEY: ${{ secrets.GOOGLE_CSE_KEY }}
-          GOOGLE_CSE_CX:  ${{ secrets.GOOGLE_CSE_CX }}
-          # optional fallbacks:
-          BING_API_KEY: ${{ secrets.BING_API_KEY }}
-          SCRAPERAPI_KEY: ${{ secrets.SCRAPERAPI_KEY }}
-        run: python -m src.main
