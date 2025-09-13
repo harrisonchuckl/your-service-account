@@ -1,4 +1,4 @@
-import base64, json, datetime
+import base64, json, datetime, binascii
 import gspread
 from google.oauth2.service_account import Credentials
 
@@ -10,18 +10,38 @@ HEADERS = [
     "EmailSubject","EmailBody","SentAt"
 ]
 
-def _client(sa_json_b64):
-    info = json.loads(base64.b64decode(sa_json_b64))
+def _load_sa_info(value: str):
+    """
+    Accepts either:
+    - Raw JSON (starts with '{')
+    - Base64-encoded JSON (with or without perfect padding)
+    """
+    s = (value or "").strip()
+    if not s:
+        raise RuntimeError("GOOGLE_SA_JSON_B64 is empty")
+    if s.startswith("{"):
+        return json.loads(s)
+    try:
+        # Add missing base64 padding if needed
+        missing = len(s) % 4
+        if missing:
+            s += "=" * (4 - missing)
+        decoded = base64.b64decode(s)
+        return json.loads(decoded)
+    except (binascii.Error, json.JSONDecodeError) as e:
+        raise RuntimeError("GOOGLE_SA_JSON_B64 is neither valid JSON nor valid base64 JSON") from e
+
+def _client(sa_json_value):
+    info = _load_sa_info(sa_json_value)
     creds = Credentials.from_service_account_info(info, scopes=SCOPES)
     return gspread.authorize(creds)
 
-def open_sheet(sa_json_b64, sheet_id, worksheet_name=None):
-    gc = _client(sa_json_b64)
+def open_sheet(sa_json_value, sheet_id, worksheet_name=None):
+    gc = _client(sa_json_value)
     sh = gc.open_by_key(sheet_id)
     return sh.worksheet(worksheet_name) if worksheet_name else sh.sheet1
 
 def read_rows(ws):
-    # expects header row present
     return ws.get_all_records()
 
 def ensure_headers(ws):
@@ -43,4 +63,3 @@ def write_result(ws, row_idx_1_based, result: dict):
         result.get("Notes", "")
     ]
     ws.update(range_name=f"C{row_idx_1_based}:I{row_idx_1_based}", values=[values])
-
