@@ -22,7 +22,6 @@ def _load_sa_info(value: str):
     if s.startswith("{"):
         return json.loads(s)
     try:
-        # Add missing base64 padding if needed
         missing = len(s) % 4
         if missing:
             s += "=" * (4 - missing)
@@ -50,9 +49,6 @@ def ensure_headers(ws):
         ws.update("A1", [HEADERS])
 
 def write_result(ws, row_idx_1_based, result: dict):
-    """
-    Writes columns C..I (Website..Notes) and updates LastChecked (H).
-    """
     values = [
         result.get("Website", ""),
         result.get("ContactEmail", ""),
