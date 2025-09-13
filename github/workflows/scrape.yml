@@ -1,1 +1,27 @@
+name: Scrape Contacts
 
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "15 7 * * *"   # 07:15 UTC daily
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+      - name: Run scraper
+        env:
+          GOOGLE_SA_JSON_B64: ${{ secrets.GOOGLE_SA_JSON_B64 }}
+          SHEET_ID: ${{ secrets.SHEET_ID }}
+          SHEET_TAB: "Sheet1"
+          MAX_ROWS: "500"
+          BING_API_KEY: ${{ secrets.BING_API_KEY }}
+          SCRAPERAPI_KEY: ${{ secrets.SCRAPERAPI_KEY }}
+        run: python -m src.main
