@@ -1,9 +1,15 @@
 import os, time
+from urllib.parse import urlparse
+import tldextract
 from .logging_utils import get_logger
 from . import sheet, search, crawl, extract
-from .config import GOOGLE_SA_JSON_B64, SHEET_ID, SHEET_TAB, MAX_ROWS
+from .config import GOOGLE_SA_JSON_B64, SHEET_ID, SHEET_TAB, MAX_ROWS, DEFAULT_LOCATION
 
 logger = get_logger("main")
+
+def _registered_domain(url):
+    ext = tldextract.extract(url or "")
+    return ext.registered_domain or ""
 
 def run():
     if not GOOGLE_SA_JSON_B64 or not SHEET_ID:
@@ -29,46 +35,55 @@ def run():
 
         logger.info(f"== {company} ==")
 
+        # 1) Resolve official site
         if not website:
             website = search.find_official_site(company, domain_hint)
-            if not website:
-                # Still write a status so you can see it was attempted
-                sheet.write_result(ws, i, {
-                    "Status": "NoWebsiteFound",
-                    "Notes": "Search provider not configured or no result"
-                })
-                writes += 1
-                processed += 1
 
-                # gentle throttling: every 25 writes, pause ~65s
-                if writes % 25 == 0:
-                    time.sleep(65)
-                else:
-                    time.sleep(1.2)
-                continue
+        contact_info = {}
+        preferred_domain = ""
+        found = False
 
-        try:
-            html_by_url = crawl.crawl_candidate_pages(website)
-            info = extract.extract_contacts(html_by_url)
-            status = "OK" if (info.get("ContactEmail") or info.get("ContactFormURL")) else "NotFound"
-            result = {
-                "Website": website,
-                **info,
-                "Status": status,
-                "Notes": "" if status == "OK" else "No generic email or contact form discovered"
-            }
-            sheet.write_result(ws, i, result)
-        except Exception as e:
-            sheet.write_result(ws, i, {
-                "Website": website,
-                "Status": "Error",
-                "Notes": str(e)
-            })
+        # 2) Crawl site (homepage + discovered links)
+        if website:
+            preferred_domain = _registered_domain(website)
+            try:
+                html_by_url = crawl.crawl_candidate_pages(website)
+                info = extract.extract_contacts(html_by_url, preferred_domain=preferred_domain, location=DEFAULT_LOCATION)
+                if info.get("ContactEmail") or info.get("ContactFormURL"):
+                    contact_info = info
+                    found = True
+            except Exception as e:
+                contact_info = {"Status": "Error", "Notes": str(e)}
+
+        # 3) Fallback: Google contact hunt
+        if not found:
+            candidates = search.google_contact_hunt(company, DEFAULT_LOCATION, limit=3)
+            html_by_url = {}
+            for u in candidates:
+                try:
+                    html_by_url[u] = crawl.fetch(u)
+                except Exception as e:
+                    logger.info(f"Skip {u}: {e}")
+            if html_by_url:
+                info = extract.extract_contacts(html_by_url, preferred_domain=preferred_domain, location=DEFAULT_LOCATION)
+                if info.get("ContactEmail") or info.get("ContactFormURL"):
+                    contact_info = info
+                    found = True
+
+        # 4) Write result
+        status = "OK" if found else ("NoWebsiteFound" if not website else "NotFound")
+        result = {
+            "Website": website or "",
+            **(contact_info or {}),
+            "Status": status,
+            "Notes": "" if status == "OK" else ("No email/form discovered" if website else "Search yielded no site")
+        }
+        sheet.write_result(ws, i, result)
 
         writes += 1
         processed += 1
 
-        # throttle to avoid Google's per-minute write limit
+        # throttle to avoid Sheets write limits
         if writes % 25 == 0:
             time.sleep(65)
         else:
