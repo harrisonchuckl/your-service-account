@@ -43,7 +43,7 @@ jobs:
           # Sheet/tab and behavior
           SHEET_TAB: "Sheet1"
           DEFAULT_LOCATION: "Ely"
-          MAX_ROWS: "80"                 # daily budget
+          MAX_ROWS: "100"                 # daily budget
           PREFER_COMPANY_DOMAIN: "1"
           GUESS_GENERICS: "1"
           # Optional fallbacks (only if you’ve added them)
