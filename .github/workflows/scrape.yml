@@ -1,61 +1,52 @@
 name: Scrape Contacts
 
 on:
+  # Manual trigger from the Actions tab
   workflow_dispatch:
+  # 9:00 London time daily (handles BST/GMT by month)
   schedule:
-    - cron: "15 7 * * *"   # 07:15 UTC daily
+    # Mar–Oct → 08:00 UTC ≈ 09:00 London (BST)
+    - cron: "0 8 * 3-10 *"
+    # Nov–Feb → 09:00 UTC ≈ 09:00 London (GMT)
+    - cron: "0 9 * 11-12,1-2 *"
+
+concurrency:
+  group: scrape-contacts
+  cancel-in-progress: true
 
 jobs:
   run:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     permissions:
       contents: read
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - run: pip install -r requirements.txt
-
-      # Safety check: validates your GOOGLE_SA_JSON_B64 secret without printing it
-      - name: Validate GOOGLE_SA_JSON_B64 (no content leak)
-        env:
-          GOOGLE_SA_JSON_B64: ${{ secrets.GOOGLE_SA_JSON_B64 }}
-        run: |
-          python - <<'PY'
-          import os, base64, json, binascii, sys
-          s=os.environ.get('GOOGLE_SA_JSON_B64','').strip()
-          if not s:
-              print("❌ Secret missing or empty"); sys.exit(1)
-          if s[:1]=='{':
-              try:
-                  json.loads(s)
-                  print("✅ Secret looks like RAW JSON and parses OK.")
-              except json.JSONDecodeError as e:
-                  print("❌ RAW JSON present but invalid:", e); sys.exit(1)
-          else:
-              try:
-                  pad = (-len(s)) % 4
-                  s2 = s + ("="*pad)
-                  decoded = base64.b64decode(s2)
-                  json.loads(decoded)
-                  print("✅ Secret looks like BASE64 JSON and parses OK.")
-              except (binascii.Error, json.JSONDecodeError) as e:
-                  print("❌ Secret is neither raw JSON nor base64 JSON. Paste the ENTIRE service account JSON."); sys.exit(1)
-          PY
+      - name: Install dependencies
+        run: pip install -r requirements.txt
 
       - name: Run scraper
         env:
+          # Required secrets
           GOOGLE_SA_JSON_B64: ${{ secrets.GOOGLE_SA_JSON_B64 }}
           SHEET_ID: ${{ secrets.SHEET_ID }}
-          SHEET_TAB: "Sheet1"
-          MAX_ROWS: "40"                 # keep modest while testing
-          DEFAULT_LOCATION: "Ely"        # <— hunts for Ely
           GOOGLE_CSE_KEY: ${{ secrets.GOOGLE_CSE_KEY }}
           GOOGLE_CSE_CX:  ${{ secrets.GOOGLE_CSE_CX }}
-          # Optional fallbacks/helpers:
+          # Sheet/tab and behavior
+          SHEET_TAB: "Sheet1"
+          DEFAULT_LOCATION: "Ely"
+          MAX_ROWS: "80"                 # daily budget
+          PREFER_COMPANY_DOMAIN: "1"
+          GUESS_GENERICS: "1"
+          # Optional fallbacks (only if you’ve added them)
           BING_API_KEY: ${{ secrets.BING_API_KEY }}
           SCRAPERAPI_KEY: ${{ secrets.SCRAPERAPI_KEY }}
         run: python -m src.main
