@@ -1,95 +1,106 @@
-import requests
-from urllib.parse import urljoin
-from requests.exceptions import SSLError, ConnectionError
-import tldextract
+# src/config.py
+import os
 
-from .config import (
-    SCRAPERAPI_KEY, SCRAPERAPI_RENDER, TIMEOUT, USER_AGENT,
-    CONTACT_PATHS, CONTACT_KEYWORDS, BAD_HOSTS,
-    MAX_CRAWL_PAGES, MAX_DISCOVERED_PER_PAGE, FOLLOW_DEPTH
-)
-from .logging_utils import get_logger
+# ---------- helpers ----------
+def _get(name: str, default: str = "") -> str:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    v = str(v).strip()
+    return v if v != "" else default
 
-logger = get_logger("crawl")
-
-def _through_scraper(url, headers):
-    api = "http://api.scraperapi.com"
-    params = {"api_key": SCRAPERAPI_KEY, "url": url}
-    if SCRAPERAPI_RENDER:
-        params["render"] = "true"
-    return requests.get(api, params=params, headers=headers, timeout=TIMEOUT)
-
-def fetch(url):
-    headers = {"User-Agent": USER_AGENT}
+def _getint(name: str, default: int) -> int:
+    v = os.getenv(name)
     try:
-        r = _through_scraper(url, headers) if SCRAPERAPI_KEY else requests.get(
-            url, headers=headers, timeout=TIMEOUT, allow_redirects=True
-        )
-        r.raise_for_status()
-        return r.text
-    except (SSLError, ConnectionError, requests.HTTPError) as e:
-        raise e
+        s = ("" if v is None else str(v).strip())
+        return int(s) if s != "" else default
+    except Exception:
+        return default
 
-def _same_registered_domain(a, b):
-    ea = tldextract.extract(a); eb = tldextract.extract(b)
-    return ea.registered_domain and (ea.registered_domain == eb.registered_domain)
+def _getbool(name: str, default: bool = False) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    s = str(v).strip().lower()
+    return s in {"1", "true", "yes", "y", "on"}
 
-def _is_bad_host(url: str) -> bool:
-    u = (url or "").lower()
-    return any(b in u for b in BAD_HOSTS)
+# ---------- required auth / sheet ----------
+GOOGLE_SA_JSON_B64 = _get("GOOGLE_SA_JSON_B64")  # base64 of the service account JSON
+SHEET_ID           = _get("SHEET_ID")            # Google Sheet ID
+SHEET_TAB          = _get("SHEET_TAB", "Sheet1")
 
-def _discover_links(html, base_url):
-    from bs4 import BeautifulSoup
-    soup = BeautifulSoup(html, "html.parser")
-    links = []
-    for a in soup.find_all("a"):
-        href = (a.get("href") or "").strip()
-        if not href:
-            continue
-        abs_url = urljoin(base_url, href)
-        if _is_bad_host(abs_url):
-            continue
-        text = (a.get_text(" ", strip=True) or "").lower()
-        target = (href or "").lower() + " " + text
-        if any(k in target for k in CONTACT_KEYWORDS):
-            links.append(abs_url)
-        if len(links) >= MAX_DISCOVERED_PER_PAGE:
-            break
-    return links
+# ---------- scraping/search behavior ----------
+DEFAULT_LOCATION   = _get("DEFAULT_LOCATION", "Ely")
 
-def crawl_candidate_pages(root_url):
-    """
-    BFS to depth FOLLOW_DEPTH within same registered domain.
-    Start with root + fixed contact paths.
-    """
-    seen = set()
-    queue = []
-    html_by_url = {}
+# network / crawl knobs
+HTTP_TIMEOUT       = _getint("HTTP_TIMEOUT", 15)          # seconds
+FETCH_DELAY_MS     = _getint("FETCH_DELAY_MS", 250)       # polite delay between requests
+MAX_PAGES_PER_SITE = _getint("MAX_PAGES_PER_SITE", 20)    # depth/limit per site
+USER_AGENT = _get(
+    "USER_AGENT",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 
-    # seed
-    queue.append((root_url, 0))
-    for path in CONTACT_PATHS:
-        u = root_url.rstrip("/") + path
-        if u != root_url:
-            queue.append((u, 1))
+# Back-compat aliases (other modules may import these names)
+TIMEOUT   = HTTP_TIMEOUT
+DELAY_MS  = FETCH_DELAY_MS
+MAX_PAGES = MAX_PAGES_PER_SITE
 
-    while queue and len(html_by_url) < MAX_CRAWL_PAGES:
-        url, depth = queue.pop(0)
-        if url in seen:
-            continue
-        seen.add(url)
-        try:
-            html = fetch(url)
-            html_by_url[url] = html
-            if depth == 0:
-                logger.info(f"Fetched homepage: {url}")
-            # discover more if depth allows
-            if depth < FOLLOW_DEPTH:
-                for nxt in _discover_links(html, url):
-                    if nxt not in seen and _same_registered_domain(root_url, nxt):
-                        queue.append((nxt, depth + 1))
-        except Exception as e:
-            logger.info(f"Skip {url}: {e}")
+# limit how many sheet rows to process per run
+MAX_ROWS = _getint("MAX_ROWS", 100)
 
-    logger.info(f"Crawled {len(html_by_url)} pages on {root_url}")
-    return html_by_url
+# ---------- Google Programmable Search (CSE) ----------
+GOOGLE_CSE_KEY           = _get("GOOGLE_CSE_KEY")
+GOOGLE_CSE_CX            = _get("GOOGLE_CSE_CX")
+GOOGLE_CSE_QPS_DELAY_MS  = _getint("GOOGLE_CSE_QPS_DELAY_MS", 800)
+GOOGLE_CSE_MAX_RETRIES   = _getint("GOOGLE_CSE_MAX_RETRIES", 5)
+
+# ---------- optional fallbacks / proxies ----------
+BING_API_KEY       = _get("BING_API_KEY", "")
+SCRAPERAPI_KEY     = _get("SCRAPERAPI_KEY", "")
+SCRAPERAPI_RENDER  = _getbool("SCRAPERAPI_RENDER", False)
+SCRAPERAPI_COUNTRY = _get("SCRAPERAPI_COUNTRY", "")            # e.g. "uk" or "us"
+SCRAPERAPI_BASE    = _get("SCRAPERAPI_BASE", "https://api.scraperapi.com")
+
+# ---------- site filters ----------
+BAD_HOSTS = {
+    "facebook.com",
+    "m.facebook.com",
+    "instagram.com",
+    "twitter.com",
+    "x.com",
+    "linkedin.com",
+    "youtube.com",
+    "yelp.com",
+    "wikipedia.org",
+}
+
+# ---------- paths the crawler should try on a homepage for contacts/about/legal ----------
+# These are relative paths that will be joined to the detected base URL.
+CONTACT_PATHS = [
+    # contact pages
+    "/contact", "/contact/", "/contact-us", "/contact-us/", "/contactus",
+    "/get-in-touch", "/get-in-touch/", "/getintouch",
+    "/contact.html", "/contact.htm", "/contact.php",
+    "/contact-us.html", "/contact-us.htm", "/contact-us.php",
+    "/company/contact",
+    # support/help
+    "/support", "/help",
+    # about / location pages (often contain emails or forms)
+    "/about", "/about-us", "/find-us", "/where-to-find-us",
+    # legal/privacy/imprint often list an email
+    "/privacy", "/privacy-policy", "/legal", "/imprint", "/impressum",
+    # team directory sometimes lists emails
+    "/team",
+]
+
+# Optional: allow adding extra paths via env (comma-separated)
+_extra = [p.strip() for p in _get("CONTACT_PATHS_EXTRA", "").split(",") if p.strip()]
+if _extra:
+    # Keep order but avoid duplicates
+    seen = set(CONTACT_PATHS)
+    for p in _extra:
+        if p not in seen:
+            CONTACT_PATHS.append(p)
+            seen.add(p)
