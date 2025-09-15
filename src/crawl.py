@@ -8,6 +8,7 @@ from urllib.parse import urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
+import tldextract
 
 from .config import (
     USER_AGENT,
@@ -26,6 +27,8 @@ log = logging.getLogger(__name__)
 HEADERS = {"User-Agent": USER_AGENT}
 
 
+# ---------- Networking helpers ----------
+
 def _scraperapi_get(url: str) -> requests.Response:
     """Route a request through ScraperAPI if a key is configured."""
     params = {
@@ -37,8 +40,12 @@ def _scraperapi_get(url: str) -> requests.Response:
     if SCRAPERAPI_COUNTRY:
         params["country_code"] = SCRAPERAPI_COUNTRY
 
-    r = requests.get(SCRAPERAPI_BASE, params=params, timeout=HTTP_TIMEOUT, headers=HEADERS)
-    return r
+    return requests.get(
+        SCRAPERAPI_BASE,
+        params=params,
+        timeout=HTTP_TIMEOUT,
+        headers=HEADERS,
+    )
 
 
 def _direct_get(url: str) -> requests.Response:
@@ -46,22 +53,60 @@ def _direct_get(url: str) -> requests.Response:
 
 
 def _fetch(url: str) -> Tuple[Optional[str], Optional[str]]:
-    """
-    Fetch a URL and return (html, error_message).
-    On non-200, returns (None, reason) but also prints a line like earlier logs.
-    """
+    """Fetch a URL and return (html, error_message)."""
     try:
-        if SCRAPERAPI_KEY:
-            r = _scraperapi_get(url)
-        else:
-            r = _direct_get(url)
-        if r.status_code == 200 and r.headers.get("content-type", "").lower().startswith("text"):
+        r = _scraperapi_get(url) if SCRAPERAPI_KEY else _direct_get(url)
+        ctype = r.headers.get("content-type", "").lower()
+        if r.status_code == 200 and ctype.startswith("text"):
             return r.text, None
-        else:
-            err = f"{r.status_code} Client Error: {r.reason} for url: {r.url}"
-            return None, err
+        err = f"{r.status_code} Client Error: {r.reason} for url: {r.url}"
+        return None, err
     except requests.RequestException as e:
         return None, str(e)
+
+
+# Public alias so main.py can call crawl.fetch(...)
+def fetch(url: str) -> Tuple[Optional[str], Optional[str]]:
+    return _fetch(url)
+
+
+# ---------- URL sanity + discovery ----------
+
+def _same_host(base: str, href: str) -> bool:
+    try:
+        b = urlparse(base)
+        h = urlparse(href)
+        bhost = (b.netloc or "").split(":")[0].lower()
+        hhost = (h.netloc or b.netloc or "").split(":")[0].lower()
+        return hhost.endswith(bhost) if bhost else True
+    except Exception:
+        return True
+
+
+def _is_plausible_http_url(u: str) -> bool:
+    """Reject junk like https://h, https://:, javascript:, mailto:, etc."""
+    if not u:
+        return False
+    u = u.strip()
+    low = u.lower()
+    if any(low.startswith(s) for s in ("mailto:", "tel:", "javascript:", "data:", "about:")):
+        return False
+    try:
+        p = urlparse(u)
+        if p.scheme not in ("http", "https"):
+            return False
+        if not p.netloc:
+            return False
+        host = p.netloc.split("@")[-1].split(":")[0]
+        if not host or " " in host or host.startswith("-") or host.endswith("-"):
+            return False
+        # real public suffix (avoids hosts like "h", "-", etc.)
+        ext = tldextract.extract(host)
+        if not ext.suffix:
+            return False
+        return True
+    except Exception:
+        return False
 
 
 def _is_contactish(href: str) -> bool:
@@ -70,37 +115,46 @@ def _is_contactish(href: str) -> bool:
     h = href.lower()
     return any(
         token in h
-        for token in [
-            "contact", "impressum", "imprint", "privacy", "support", "help",
+        for token in (
+            "contact", "kontakt", "impressum", "privacy", "support", "help",
             "about", "team", "find-us", "where-to-find-us"
-        ]
+        )
     )
 
 
-def _same_host(base: str, href: str) -> bool:
-    try:
-        b = urlparse(base)
-        h = urlparse(href)
-        return (h.netloc or b.netloc).split(":")[0].lower().endswith(b.netloc.split(":")[0].lower())
-    except Exception:
-        return True  # be permissive if parsing fails
-
-
 def _discover_contactish_links(base_url: str, html: str, max_links: int = 30) -> List[str]:
-    """From a page, collect contact-ish links (same host), absolute and deduped."""
+    """Collect contact-ish links (absolute, deduped, same host, plausible)."""
     out: List[str] = []
     seen = set()
     soup = BeautifulSoup(html or "", "html.parser")
+
     for a in soup.find_all("a", href=True):
-        href = a.get("href")
+        href = (a.get("href") or "").strip()
+        if not href:
+            continue
+
+        # Ignore pure fragments and non-http schemes early
+        low = href.lower()
+        if low.startswith("#") or any(low.startswith(s) for s in ("mailto:", "tel:", "javascript:", "data:", "about:")):
+            continue
+
         abs_url = urljoin(base_url, href)
+
+        # Must be plausible and same host
+        if not _is_plausible_http_url(abs_url):
+            continue
+        if not _same_host(base_url, abs_url):
+            continue
+        if not _is_contactish(abs_url):
+            continue
+
         if abs_url in seen:
             continue
-        if _is_contactish(href) and _same_host(base_url, abs_url):
-            out.append(abs_url)
-            seen.add(abs_url)
-            if len(out) >= max_links:
-                break
+        out.append(abs_url)
+        seen.add(abs_url)
+        if len(out) >= max_links:
+            break
+
     return out
 
 
@@ -110,16 +164,15 @@ def _normalize(url: str) -> str:
     u = url.strip()
     if u.startswith("//"):
         u = "https:" + u
-    if not u.startswith("http://") and not u.startswith("https://"):
-        u = "https://" + u
     return u
 
+
+# ---------- Public crawl functions ----------
 
 def crawl_site(start_url: str) -> Dict[str, str]:
     """
     Crawl a site looking for contact-like pages.
     Returns {url: html} for pages fetched successfully.
-    Mirrors the logging style you saw earlier.
     """
     start_url = _normalize(start_url)
     out: Dict[str, str] = {}
@@ -131,7 +184,7 @@ def crawl_site(start_url: str) -> Dict[str, str]:
         out[start_url] = html
     else:
         print(f"[INFO] Skip {start_url}: {err}")
-        return out  # nothing else we can do
+        return out
 
     # Probe common contact-ish paths off the root
     parsed = urlparse(start_url)
@@ -148,9 +201,10 @@ def crawl_site(start_url: str) -> Dict[str, str]:
             fetched += 1
             time.sleep(FETCH_DELAY_MS / 1000.0)
         else:
+            # Keep the prior "Skip ..." style for continuity
             print(f"[INFO] Skip {url}: {err2}")
 
-    # Discover additional candidates from homepage
+    # Discover additional candidates from homepage (tight filtering)
     more = _discover_contactish_links(start_url, html, max_links=50)
     if more:
         print(f"[INFO] Discovered {len(more)} contact-like links on homepage")
@@ -158,7 +212,7 @@ def crawl_site(start_url: str) -> Dict[str, str]:
     for url in more:
         if fetched >= MAX_PAGES_PER_SITE:
             break
-        if url in out:
+        if url in out or not _is_plausible_http_url(url):
             continue
         html3, err3 = _fetch(url)
         if html3:
@@ -179,11 +233,12 @@ def crawl_candidate_pages(urls: Iterable[str]) -> Dict[str, str]:
     """
     out: Dict[str, str] = {}
     for u in urls:
-        url = _normalize(u)
-        html, err = _fetch(url)
+        if not _is_plausible_http_url(u):
+            continue
+        html, err = _fetch(u)
         if html:
-            out[url] = html
+            out[u] = html
         else:
-            print(f"[INFO] Skip {url}: {err}")
+            print(f"[INFO] Skip {u}: {err}")
         time.sleep(FETCH_DELAY_MS / 1000.0)
     return out
