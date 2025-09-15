@@ -1,98 +1,121 @@
 # src/config.py
 from __future__ import annotations
+
 import os
-from typing import List
+import re
 
-# ---------------------------
-# Env helpers
-# ---------------------------
-def _get(name: str, default: str = "") -> str:
-    return os.getenv(name, default)
+# ----------------------------
+# Helpers to read environment
+# ----------------------------
 
-def _getint(name: str, default: str) -> int:
-    raw = _get(name, default).strip()
+def _getstr(name: str, default: str) -> str:
+    v = os.getenv(name)
+    return default if v is None or v == "" else v
+
+def _getint(name: str, default: int) -> int:
+    v = os.getenv(name)
     try:
-        return int(raw if raw != "" else default)
+        return int(v) if v not in (None, "") else int(default)
     except Exception:
         return int(default)
 
-def _getbool(name: str, default: str = "false") -> bool:
-    return _get(name, default).strip().lower() in {"1", "true", "yes", "on"}
+def _getbool(name: str, default: bool) -> bool:
+    v = os.getenv(name)
+    if v is None:
+        return default
+    v = v.strip().lower()
+    return v in ("1", "true", "t", "yes", "y", "on")
 
-# ---------------------------
-# Core (Sheets & Google CSE)
-# ---------------------------
-GOOGLE_SA_JSON_B64 = _get("GOOGLE_SA_JSON_B64", "")
-SHEET_ID           = _get("SHEET_ID", "")
-SHEET_TAB          = _get("SHEET_TAB", "Sheet1")
-DEFAULT_LOCATION   = _get("DEFAULT_LOCATION", "Ely")
-MAX_ROWS           = _getint("MAX_ROWS", "100")
+# ----------------------------
+# General / sheet settings
+# ----------------------------
 
-GOOGLE_CSE_KEY           = _get("GOOGLE_CSE_KEY", "")
-GOOGLE_CSE_CX            = _get("GOOGLE_CSE_CX", "")
-GOOGLE_CSE_QPS_DELAY_MS  = _getint("GOOGLE_CSE_QPS_DELAY_MS", "800")
-GOOGLE_CSE_MAX_RETRIES   = _getint("GOOGLE_CSE_MAX_RETRIES", "5")
-MAX_GOOGLE_CANDIDATES    = _getint("MAX_GOOGLE_CANDIDATES", "6")
+GOOGLE_SA_JSON_B64 = _getstr("GOOGLE_SA_JSON_B64", "")
+SHEET_ID           = _getstr("SHEET_ID", "")
+SHEET_TAB          = _getstr("SHEET_TAB", "Sheet1")
+DEFAULT_LOCATION   = _getstr("DEFAULT_LOCATION", "Ely")
+MAX_ROWS           = _getint("MAX_ROWS", 100)
 
-# ---------------------------
-# HTTP / crawling
-# ---------------------------
-HTTP_TIMEOUT      = _getint("HTTP_TIMEOUT", "20")   # seconds
-TIMEOUT           = HTTP_TIMEOUT                    # legacy alias
-FETCH_DELAY_MS    = _getint("FETCH_DELAY_MS", "300")
-FETCH_MAX_PAGES   = _getint("FETCH_MAX_PAGES", "40")
-MAX_CONTACT_PAGES = _getint("MAX_CONTACT_PAGES", "20")
+# ----------------------------
+# HTTP / crawl settings
+# ----------------------------
 
-# Optional proxy / rendering
-SCRAPERAPI_KEY     = _get("SCRAPERAPI_KEY", "")
-SCRAPERAPI_BASE    = _get("SCRAPERAPI_BASE", "https://api.scraperapi.com/")
-SCRAPERAPI_RENDER  = _getbool("SCRAPERAPI_RENDER", "false")
-# Country code for ScraperAPI (e.g. 'uk', 'us'); blank means don't force geo
-SCRAPERAPI_COUNTRY = _get("SCRAPERAPI_COUNTRY", "").lower()
+USER_AGENT            = _getstr("USER_AGENT", "Mozilla/5.0 (compatible; ContactCrawler/1.0; +https://example.com/bot)")
+HTTP_TIMEOUT          = _getint("HTTP_TIMEOUT", 15)         # seconds per request
+FETCH_DELAY_MS        = _getint("FETCH_DELAY_MS", 400)      # polite delay between fetches
+MAX_PAGES_PER_SITE    = _getint("MAX_PAGES_PER_SITE", 40)   # hard cap per domain
+MIN_PAGES_BEFORE_FALLBACK = _getint("MIN_PAGES_BEFORE_FALLBACK", 6)  # try at least this many pages before using Google fallback
+SITE_BUDGET_SECONDS   = _getint("SITE_BUDGET_SECONDS", 25)  # per-site time budget
 
-# ---------------------------
-# Heuristics & preferences
-# ---------------------------
-PREFER_COMPANY_DOMAIN = _getbool("PREFER_COMPANY_DOMAIN", "true")
+# Back-compat alias some code may import
+TIMEOUT = HTTP_TIMEOUT
 
-# Enable to guess info@ / hello@ etc if nothing found
-GUESS_GENERICS = _getbool("GUESS_GENERICS", "false")
-_DEFAULT_GUESS_PREFIXES: List[str] = [
-    "info", "hello", "contact", "sales", "enquiries", "enquiry", "admin"
-]
-GENERIC_GUESS_PREFIXES: List[str] = _DEFAULT_GUESS_PREFIXES if GUESS_GENERICS else []
-
-# Likely contact-ish paths to probe on a site
-CONTACT_PATHS: List[str] = [
-    "contact", "contact-us", "contactus", "get-in-touch", "getintouch",
-    "support", "help", "privacy", "imprint", "impressum", "about", "team",
-    "where-to-find-us", "find-us"
+# Paths/keywords to prioritise while crawling
+CONTACT_PATHS = [
+    r"/contact([-/]|$)",
+    r"/get[-_]?in[-_]?touch",
+    r"/support",
+    r"/help",
+    r"/about",
+    r"/impressum",
+    r"/company/contact",
 ]
 
-# Deprioritize / skip these hosts from results
-BAD_HOSTS: List[str] = [
-    # social / platforms
-    "facebook.com", "linkedin.com", "twitter.com", "x.com", "instagram.com",
-    "youtube.com", "tiktok.com", "pinterest.com", "yelp.com", "foursquare.com",
-    "medium.com", "blogspot.com", "wordpress.com", "typepad.com", "reddit.com",
-    "wikipedia.org",
+CONTACT_KEYWORDS = ["contact", "enquire", "inquiry", "get in touch", "email us"]
 
-    # marketplaces / aggregators / portals
-    "amazon.com", "amazon.co.uk", "opentable.com", "ubuy.com",
-    "tripadvisor.com", "tripadvisor.co.uk",
-
-    # large gov / non-local portals that drown out SMEs
-    "fda.gov",
+BAD_EXTENSIONS = [
+    ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
+    ".jpg", ".jpeg", ".png", ".gif", ".svg", ".webp", ".ico",
+    ".zip", ".rar", ".7z"
 ]
 
-# ---------------------------
-# Headers / UA
-# ---------------------------
-USER_AGENT = _get("USER_AGENT", "Mozilla/5.0 (compatible; ChucklScraper/1.0)")
-HEADERS = {"User-Agent": USER_AGENT}
+BAD_PATH_SNIPPETS = ["/wp-content/", "/static/", "/assets/", "/uploads/", "/media/"]
 
-# ---------------------------
-# Backward-compat aliases
-# ---------------------------
-MAX_PAGES_PER_SITE = FETCH_MAX_PAGES
-REQUEST_HEADERS    = HEADERS
+# ----------------------------
+# Email / form extraction
+# ----------------------------
+
+EMAIL_RE  = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,24}", re.IGNORECASE)
+MAILTO_RE = re.compile(r'href=["\']mailto:([^"\']+)["\']', re.IGNORECASE)
+
+CONTACT_FORM_HINTS     = ["wpcf7", "wpforms", "hs-form", "hubspot", "formspree", "gravityforms", "contact-form"]
+FORM_REQUIRE_FIELDS_ANY = ["email"]
+FORM_REQUIRE_FIELDS_ALL = ["message"]  # matched via id/name/placeholder/label text
+
+# Behaviour toggles
+PREFER_COMPANY_DOMAIN  = _getbool("PREFER_COMPANY_DOMAIN", True)
+EMAIL_GUESS_ENABLE     = _getbool("EMAIL_GUESS_ENABLE", False)  # keep False to avoid guesses
+
+GENERIC_GUESS_PREFIXES = ["info"]  # very conservative if guessing is ever enabled
+# Back-compat alias if older modules import this name
+GUESS_GENERICS = GENERIC_GUESS_PREFIXES
+
+# ----------------------------
+# Search (Google CSE / Bing)
+# ----------------------------
+
+GOOGLE_CSE_KEY            = _getstr("GOOGLE_CSE_KEY", "")
+GOOGLE_CSE_CX             = _getstr("GOOGLE_CSE_CX", "")
+GOOGLE_CSE_QPS_DELAY_MS   = _getint("GOOGLE_CSE_QPS_DELAY_MS", 800)
+GOOGLE_CSE_MAX_RETRIES    = _getint("GOOGLE_CSE_MAX_RETRIES", 5)
+MAX_GOOGLE_CANDIDATES     = _getint("MAX_GOOGLE_CANDIDATES", 4)
+
+BING_API_KEY              = _getstr("BING_API_KEY", "")
+
+# Filter out generic/low-signal hosts when evaluating search candidates
+BAD_HOSTS = [
+    "facebook.com", "linkedin.com", "twitter.com", "x.com", "instagram.com", "youtube.com",
+    "wikipedia.org", "reddit.com", "medium.com", "blogspot.com", "wordpress.com",
+    "typepad.com", "pinterest.com", "foursquare.com", "yelp.com",
+    "fda.gov", "opentable.com", "amazon.com", "amazon.co.uk", "aws.amazon.com",
+    "ubuy.com", "tumblr.com"
+]
+
+# ----------------------------
+# ScraperAPI (optional)
+# ----------------------------
+
+SCRAPERAPI_KEY     = _getstr("SCRAPERAPI_KEY", "")
+SCRAPERAPI_BASE    = _getstr("SCRAPERAPI_BASE", "https://api.scraperapi.com")
+SCRAPERAPI_COUNTRY = _getstr("SCRAPERAPI_COUNTRY", "")   # e.g., "uk", "us"
+SCRAPERAPI_RENDER  = _getbool("SCRAPERAPI_RENDER", False)
