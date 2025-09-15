@@ -1,106 +1,189 @@
-# src/config.py
-import os
+# src/crawl.py
+from __future__ import annotations
 
-# ---------- helpers ----------
-def _get(name: str, default: str = "") -> str:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    v = str(v).strip()
-    return v if v != "" else default
+import time
+import logging
+from typing import Dict, Iterable, List, Tuple, Optional
+from urllib.parse import urljoin, urlparse
 
-def _getint(name: str, default: int) -> int:
-    v = os.getenv(name)
-    try:
-        s = ("" if v is None else str(v).strip())
-        return int(s) if s != "" else default
-    except Exception:
-        return default
+import requests
+from bs4 import BeautifulSoup
 
-def _getbool(name: str, default: bool = False) -> bool:
-    v = os.getenv(name)
-    if v is None:
-        return default
-    s = str(v).strip().lower()
-    return s in {"1", "true", "yes", "y", "on"}
-
-# ---------- required auth / sheet ----------
-GOOGLE_SA_JSON_B64 = _get("GOOGLE_SA_JSON_B64")  # base64 of the service account JSON
-SHEET_ID           = _get("SHEET_ID")            # Google Sheet ID
-SHEET_TAB          = _get("SHEET_TAB", "Sheet1")
-
-# ---------- scraping/search behavior ----------
-DEFAULT_LOCATION   = _get("DEFAULT_LOCATION", "Ely")
-
-# network / crawl knobs
-HTTP_TIMEOUT       = _getint("HTTP_TIMEOUT", 15)          # seconds
-FETCH_DELAY_MS     = _getint("FETCH_DELAY_MS", 250)       # polite delay between requests
-MAX_PAGES_PER_SITE = _getint("MAX_PAGES_PER_SITE", 20)    # depth/limit per site
-USER_AGENT = _get(
-    "USER_AGENT",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+from .config import (
+    USER_AGENT,
+    HTTP_TIMEOUT,
+    FETCH_DELAY_MS,
+    MAX_PAGES_PER_SITE,
+    CONTACT_PATHS,
+    SCRAPERAPI_KEY,
+    SCRAPERAPI_BASE,
+    SCRAPERAPI_RENDER,
+    SCRAPERAPI_COUNTRY,
 )
 
-# Back-compat aliases (other modules may import these names)
-TIMEOUT   = HTTP_TIMEOUT
-DELAY_MS  = FETCH_DELAY_MS
-MAX_PAGES = MAX_PAGES_PER_SITE
+log = logging.getLogger(__name__)
 
-# limit how many sheet rows to process per run
-MAX_ROWS = _getint("MAX_ROWS", 100)
+HEADERS = {"User-Agent": USER_AGENT}
 
-# ---------- Google Programmable Search (CSE) ----------
-GOOGLE_CSE_KEY           = _get("GOOGLE_CSE_KEY")
-GOOGLE_CSE_CX            = _get("GOOGLE_CSE_CX")
-GOOGLE_CSE_QPS_DELAY_MS  = _getint("GOOGLE_CSE_QPS_DELAY_MS", 800)
-GOOGLE_CSE_MAX_RETRIES   = _getint("GOOGLE_CSE_MAX_RETRIES", 5)
 
-# ---------- optional fallbacks / proxies ----------
-BING_API_KEY       = _get("BING_API_KEY", "")
-SCRAPERAPI_KEY     = _get("SCRAPERAPI_KEY", "")
-SCRAPERAPI_RENDER  = _getbool("SCRAPERAPI_RENDER", False)
-SCRAPERAPI_COUNTRY = _get("SCRAPERAPI_COUNTRY", "")            # e.g. "uk" or "us"
-SCRAPERAPI_BASE    = _get("SCRAPERAPI_BASE", "https://api.scraperapi.com")
+def _scraperapi_get(url: str) -> requests.Response:
+    """Route a request through ScraperAPI if a key is configured."""
+    params = {
+        "api_key": SCRAPERAPI_KEY,
+        "url": url,
+    }
+    if SCRAPERAPI_RENDER:
+        params["render"] = "true"
+    if SCRAPERAPI_COUNTRY:
+        params["country_code"] = SCRAPERAPI_COUNTRY
 
-# ---------- site filters ----------
-BAD_HOSTS = {
-    "facebook.com",
-    "m.facebook.com",
-    "instagram.com",
-    "twitter.com",
-    "x.com",
-    "linkedin.com",
-    "youtube.com",
-    "yelp.com",
-    "wikipedia.org",
-}
+    r = requests.get(SCRAPERAPI_BASE, params=params, timeout=HTTP_TIMEOUT, headers=HEADERS)
+    return r
 
-# ---------- paths the crawler should try on a homepage for contacts/about/legal ----------
-# These are relative paths that will be joined to the detected base URL.
-CONTACT_PATHS = [
-    # contact pages
-    "/contact", "/contact/", "/contact-us", "/contact-us/", "/contactus",
-    "/get-in-touch", "/get-in-touch/", "/getintouch",
-    "/contact.html", "/contact.htm", "/contact.php",
-    "/contact-us.html", "/contact-us.htm", "/contact-us.php",
-    "/company/contact",
-    # support/help
-    "/support", "/help",
-    # about / location pages (often contain emails or forms)
-    "/about", "/about-us", "/find-us", "/where-to-find-us",
-    # legal/privacy/imprint often list an email
-    "/privacy", "/privacy-policy", "/legal", "/imprint", "/impressum",
-    # team directory sometimes lists emails
-    "/team",
-]
 
-# Optional: allow adding extra paths via env (comma-separated)
-_extra = [p.strip() for p in _get("CONTACT_PATHS_EXTRA", "").split(",") if p.strip()]
-if _extra:
-    # Keep order but avoid duplicates
-    seen = set(CONTACT_PATHS)
-    for p in _extra:
-        if p not in seen:
-            CONTACT_PATHS.append(p)
-            seen.add(p)
+def _direct_get(url: str) -> requests.Response:
+    return requests.get(url, timeout=HTTP_TIMEOUT, headers=HEADERS, allow_redirects=True)
+
+
+def _fetch(url: str) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Fetch a URL and return (html, error_message).
+    On non-200, returns (None, reason) but also prints a line like earlier logs.
+    """
+    try:
+        if SCRAPERAPI_KEY:
+            r = _scraperapi_get(url)
+        else:
+            r = _direct_get(url)
+        if r.status_code == 200 and r.headers.get("content-type", "").lower().startswith("text"):
+            return r.text, None
+        else:
+            err = f"{r.status_code} Client Error: {r.reason} for url: {r.url}"
+            return None, err
+    except requests.RequestException as e:
+        return None, str(e)
+
+
+def _is_contactish(href: str) -> bool:
+    if not href:
+        return False
+    h = href.lower()
+    return any(
+        token in h
+        for token in [
+            "contact", "impressum", "imprint", "privacy", "support", "help",
+            "about", "team", "find-us", "where-to-find-us"
+        ]
+    )
+
+
+def _same_host(base: str, href: str) -> bool:
+    try:
+        b = urlparse(base)
+        h = urlparse(href)
+        return (h.netloc or b.netloc).split(":")[0].lower().endswith(b.netloc.split(":")[0].lower())
+    except Exception:
+        return True  # be permissive if parsing fails
+
+
+def _discover_contactish_links(base_url: str, html: str, max_links: int = 30) -> List[str]:
+    """From a page, collect contact-ish links (same host), absolute and deduped."""
+    out: List[str] = []
+    seen = set()
+    soup = BeautifulSoup(html or "", "html.parser")
+    for a in soup.find_all("a", href=True):
+        href = a.get("href")
+        abs_url = urljoin(base_url, href)
+        if abs_url in seen:
+            continue
+        if _is_contactish(href) and _same_host(base_url, abs_url):
+            out.append(abs_url)
+            seen.add(abs_url)
+            if len(out) >= max_links:
+                break
+    return out
+
+
+def _normalize(url: str) -> str:
+    if not url:
+        return url
+    u = url.strip()
+    if u.startswith("//"):
+        u = "https:" + u
+    if not u.startswith("http://") and not u.startswith("https://"):
+        u = "https://" + u
+    return u
+
+
+def crawl_site(start_url: str) -> Dict[str, str]:
+    """
+    Crawl a site looking for contact-like pages.
+    Returns {url: html} for pages fetched successfully.
+    Mirrors the logging style you saw earlier.
+    """
+    start_url = _normalize(start_url)
+    out: Dict[str, str] = {}
+    fetched = 0
+
+    print(f"[INFO] Fetched homepage: {start_url}")
+    html, err = _fetch(start_url)
+    if html:
+        out[start_url] = html
+    else:
+        print(f"[INFO] Skip {start_url}: {err}")
+        return out  # nothing else we can do
+
+    # Probe common contact-ish paths off the root
+    parsed = urlparse(start_url)
+    root = f"{parsed.scheme}://{parsed.netloc}"
+    for p in CONTACT_PATHS:
+        if fetched >= MAX_PAGES_PER_SITE:
+            break
+        url = urljoin(root, p)
+        if url in out:
+            continue
+        html2, err2 = _fetch(url)
+        if html2:
+            out[url] = html2
+            fetched += 1
+            time.sleep(FETCH_DELAY_MS / 1000.0)
+        else:
+            print(f"[INFO] Skip {url}: {err2}")
+
+    # Discover additional candidates from homepage
+    more = _discover_contactish_links(start_url, html, max_links=50)
+    if more:
+        print(f"[INFO] Discovered {len(more)} contact-like links on homepage")
+
+    for url in more:
+        if fetched >= MAX_PAGES_PER_SITE:
+            break
+        if url in out:
+            continue
+        html3, err3 = _fetch(url)
+        if html3:
+            out[url] = html3
+            fetched += 1
+            time.sleep(FETCH_DELAY_MS / 1000.0)
+        else:
+            print(f"[INFO] Skip {url}: {err3}")
+
+    print(f"[INFO] Crawled {len(out)} pages on {root}")
+    return out
+
+
+def crawl_candidate_pages(urls: Iterable[str]) -> Dict[str, str]:
+    """
+    Fetch a small set of specific candidate URLs (e.g., from Google contact hunt).
+    Returns {url: html} for successes.
+    """
+    out: Dict[str, str] = {}
+    for u in urls:
+        url = _normalize(u)
+        html, err = _fetch(url)
+        if html:
+            out[url] = html
+        else:
+            print(f"[INFO] Skip {url}: {err}")
+        time.sleep(FETCH_DELAY_MS / 1000.0)
+    return out
