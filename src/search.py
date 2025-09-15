@@ -1,217 +1,194 @@
 # src/search.py
 from __future__ import annotations
-
 import time
-import logging
-from typing import List, Dict, Any, Optional
+import re
+from typing import List, Iterable
 from urllib.parse import urlparse
 
 import requests
+import tldextract
 
 from .config import (
-    BAD_HOSTS,
     GOOGLE_CSE_KEY,
     GOOGLE_CSE_CX,
     GOOGLE_CSE_QPS_DELAY_MS,
     GOOGLE_CSE_MAX_RETRIES,
     MAX_GOOGLE_CANDIDATES,
+    DEFAULT_LOCATION,
+    BAD_HOSTS,
+    CONTACT_PATHS,
+    HEADERS,
+    PREFER_COMPANY_DOMAIN,
 )
 
-log = logging.getLogger(__name__)
+# ---- helpers ----------------------------------------------------------
 
-CSE_ENDPOINT = "https://www.googleapis.com/customsearch/v1"
+_DEF_EXCLUDE_EXT = re.compile(r"\.(pdf|docx?|xlsx?|pptx?|zip|rar)(?:$|\?)", re.I)
 
-
-def _host(url: str) -> str:
+def _is_bad_host(url: str) -> bool:
     try:
-        return urlparse(url).netloc.lower()
+        host = urlparse(url).netloc.lower()
     except Exception:
-        return ""
+        return True
+    host = host.lstrip("www.")
+    return any(host == bad or host.endswith("." + bad) for bad in BAD_HOSTS)
 
+def _same_registered_domain(a: str, b: str) -> bool:
+    ea = tldextract.extract(a)
+    eb = tldextract.extract(b)
+    return (ea.domain, ea.suffix) == (eb.domain, eb.suffix) and ea.suffix != ""
 
-def _is_bad(url: str) -> bool:
-    h = _host(url)
-    return any(h.endswith(bad) for bad in BAD_HOSTS)
+def _normalize_url(u: str) -> str:
+    u = u.strip()
+    if u.startswith("//"):
+        return "https:" + u
+    if not u.startswith("http"):
+        return "https://" + u
+    return u
 
-
-def _google_search(query: str, num: int = 5) -> List[Dict[str, Any]]:
-    """
-    Thin wrapper over Google Programmable Search JSON API with retry/backoff.
-    Returns the raw 'items' list (may be empty).
-    """
-    if not GOOGLE_CSE_KEY or not GOOGLE_CSE_CX:
-        return []
-
+def _google_search(query: str, num: int = 5) -> List[str]:
+    """Call Google CSE with backoff, return list of urls."""
     params = {
-        "key": GOOGLE_CSE_KEY.strip(),
-        "cx": GOOGLE_CSE_CX.strip(),
-        "q": query,
-        "num": max(1, min(10, num)),
+        "key": GOOGLE_CSE_KEY,
+        "cx":  GOOGLE_CSE_CX,
+        "q":   query,
+        "num": max(1, min(num, 10)),
         "safe": "off",
     }
-
-    delay = max(100, GOOGLE_CSE_QPS_DELAY_MS) / 1000.0
-    tries = max(1, GOOGLE_CSE_MAX_RETRIES)
-
-    last_exc: Optional[Exception] = None
-    for attempt in range(tries):
-        try:
-            r = requests.get(CSE_ENDPOINT, params=params, timeout=15)
-            if r.status_code == 200:
-                data = r.json()
-                return data.get("items", []) or []
-            # Handle 429/5xx with backoff
-            if r.status_code in (429, 500, 502, 503, 504):
-                time.sleep(delay * (2 ** attempt))
-                continue
-            # Other errors: raise
-            r.raise_for_status()
-        except Exception as e:
-            last_exc = e
-            time.sleep(delay * (2 ** attempt))
-
-    if last_exc:
-        raise last_exc
+    backoff = 0.5
+    for attempt in range(GOOGLE_CSE_MAX_RETRIES):
+        r = requests.get(
+            "https://www.googleapis.com/customsearch/v1",
+            params=params,
+            headers=HEADERS,
+            timeout=20,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            items = data.get("items") or []
+            urls = []
+            for it in items:
+                link = it.get("link", "")
+                if not link:
+                    continue
+                link = _normalize_url(link)
+                if _DEF_EXCLUDE_EXT.search(link):
+                    continue
+                if _is_bad_host(link):
+                    continue
+                urls.append(link)
+            # gentle throttle
+            time.sleep(GOOGLE_CSE_QPS_DELAY_MS / 1000.0)
+            return urls
+        elif r.status_code == 429:
+            time.sleep(backoff)
+            backoff = min(8.0, backoff * 2)
+            continue
+        else:
+            # small pause but keep going
+            time.sleep(0.25)
     return []
 
-
-def _first_good_url(items: List[Dict[str, Any]]) -> Optional[str]:
-    for it in items:
-        url = (it.get("link") or "").strip()
-        if not url or _is_bad(url):
-            continue
-        return url
-    return None
-
-
-def _prefer_domain(urls: List[str], domain_hint: Optional[str]) -> Optional[str]:
-    if not urls:
-        return None
-    if not domain_hint:
-        return urls[0]
-    dom = domain_hint.lower().lstrip("@").strip()
-    for u in urls:
-        if _host(u).endswith(dom):
-            return u
-    return urls[0]
-
-
-def find_official_site(company: str, domain_hint: Optional[str] = None) -> Optional[str]:
-    """
-    Try to get the company's official site via CSE. If a domain hint is provided,
-    prefer URLs on that domain.
-    """
-    queries = []
-    company_clean = (company or "").strip()
-    if not company_clean:
-        return None
-
-    if domain_hint:
-        dom = domain_hint.strip().lower()
-        queries.extend([
-            f"{company_clean} site:{dom}",
-            f"{company_clean} official site site:{dom}",
-        ])
-
-    # General queries
-    queries.extend([
-        f"{company_clean} official site",
-        f"{company_clean} website",
-        f"{company_clean}",
-    ])
-
-    candidates: List[str] = []
+def _uniq_keep_order(seq: Iterable[str]) -> List[str]:
     seen = set()
-    for q in queries:
-        items = _google_search(q, num=5)
-        for it in items:
-            url = (it.get("link") or "").strip()
-            if not url or _is_bad(url):
-                continue
-            if url not in seen:
-                candidates.append(url)
-                seen.add(url)
-        if candidates:
-            break  # good enough
+    out: List[str] = []
+    for s in seq:
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
 
-    if not candidates:
-        return None
-    chosen = _prefer_domain(candidates, domain_hint)
-    print(f"[INFO] [{company_clean}] Google resolved: {chosen}")
-    return chosen
+# ---- public API -------------------------------------------------------
 
+def find_official_site(company: str, domain_hint: str | None = None) -> str | None:
+    """
+    Try to resolve the company's official site:
+      1) If domain_hint is provided, prefer it.
+      2) Try queries with DEFAULT_LOCATION to localize.
+      3) Return the first non-bad host result.
+    """
+    if domain_hint:
+        try:
+            # trust the hint; normalize
+            return _normalize_url(domain_hint)
+        except Exception:
+            pass
+
+    qlist = [
+        f"{company} official site {DEFAULT_LOCATION}",
+        f"{company} website {DEFAULT_LOCATION}",
+        f"{company} contact {DEFAULT_LOCATION}",
+        f"{company} {DEFAULT_LOCATION}",
+    ]
+
+    for q in qlist:
+        urls = _google_search(q, 5)
+        for u in urls:
+            if not _is_bad_host(u):
+                return u
+    return None
 
 def google_contact_hunt(
     company: str,
-    location: Optional[str] = None,
-    domain_for_site: Optional[str] = None,
-    limit: int = 4,
+    location: str | None = None,
+    domain_for_site: str | None = None,
+    limit: int = MAX_GOOGLE_CANDIDATES,
 ) -> List[str]:
     """
-    Use CSE to find contact-ish pages for a company. Returns a list of candidate URLs.
+    Build a small set of likely 'contact-ish' URLs, favoring the official domain if known.
+    We return raw URLs; upstream code should fetch and extract emails/forms.
     """
-    company = (company or "").strip()
-    location = (location or "").strip()
-    limit = max(1, min(limit, MAX_GOOGLE_CANDIDATES))
-
+    loc = location or DEFAULT_LOCATION
     queries: List[str] = []
 
-    # If we know the official domain, focus there first
+    # If we know the domain, stick to it.
     if domain_for_site:
-        dom = domain_for_site.strip().lower()
-        base = f"site:{dom}"
+        host = urlparse(_normalize_url(domain_for_site)).netloc
+        root = tldextract.extract(host)
+        site_root = ".".join([p for p in [root.domain, root.suffix] if p])
+        if site_root:
+            # site-restricted queries
+            for path in CONTACT_PATHS + ["privacy-policy", "contact-us"]:
+                queries.append(f"site:{site_root} {path}")
+            queries.append(f"site:{site_root} email")
+            queries.append(f"site:{site_root} mailto")
+            queries.append(f"site:{site_root} contact email")
+    else:
+        # No domain known: search with company+location + contact-y words
+        base = f"{company} {loc}"
         queries.extend([
             f"{base} contact",
-            f"{base} contact us",
-            f"{base} kontakt",
-            f"{base} impressum",
+            f"{base} email",
             f"{base} privacy",
+            f"{base} contact us",
             f"{base} support",
+            f"{base} about",
         ])
 
-    # Company + contact permutations
-    queries.extend([
-        f"{company} contact",
-        f"{company} contact us",
-        f"{company} email",
-        f"{company} privacy",
-    ])
-    if location:
-        queries.extend([
-            f"{company} {location} contact",
-            f"{company} {location} email",
-        ])
-
-    results: List[str] = []
-    seen = set()
-
-    for q in queries:
-        try:
-            items = _google_search(q, num=5)
-        except Exception:
-            # swallow CSE transient failures so the run continues
-            items = []
-
-        for it in items:
-            url = (it.get("link") or "").strip()
-            if not url or _is_bad(url):
-                continue
-            # prefer obviously contact-ish pages
-            path = urlparse(url).path.lower()
-            if any(tok in path for tok in ("contact", "kontakt", "impressum", "privacy")) or domain_for_site and _host(url).endswith(domain_for_site.lower()):
-                if url not in seen:
-                    results.append(url)
-                    seen.add(url)
-                    if len(results) >= limit:
-                        break
-        if len(results) >= limit:
+    # De-dup queries, run them, collect URLs
+    urls: List[str] = []
+    for q in _uniq_keep_order(queries):
+        urls.extend(_google_search(q, 5))
+        if len(urls) >= (limit * 2):
             break
 
-        time.sleep(max(0.1, GOOGLE_CSE_QPS_DELAY_MS / 1000.0))
+    # Candidate post-filter:
+    # - drop bad hosts
+    # - if we know the official domain, prefer same registered domain
+    urls = [u for u in urls if not _is_bad_host(u)]
+    urls = _uniq_keep_order(urls)
 
-    if results:
-        print(f"[INFO] Google candidates: {results}")
-    else:
-        print("[INFO] Google candidates: []")
+    if domain_for_site and PREFER_COMPANY_DOMAIN:
+        preferred, other = [], []
+        for u in urls:
+            try:
+                if _same_registered_domain(u, domain_for_site):
+                    preferred.append(u)
+                else:
+                    other.append(u)
+            except Exception:
+                other.append(u)
+        urls = preferred + other
 
-    return results
+    # Keep the first N
+    return urls[:max(1, limit)]
