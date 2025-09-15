@@ -1,10 +1,11 @@
+# src/config.py
 import os
 
 def _getenv(name: str, default: str = "") -> str:
     v = os.getenv(name)
     return (v if v is not None else default).strip()
 
-def _getint(name: str, default: str | int) -> int:
+def _getint(name: str, default: int | str) -> int:
     try:
         return int(_getenv(name, str(default)))
     except Exception:
@@ -21,12 +22,16 @@ SHEET_TAB          = _getenv("SHEET_TAB", "Sheet1")
 
 # === Run parameters ===
 DEFAULT_LOCATION   = _getenv("DEFAULT_LOCATION", "Ely")
-MAX_ROWS           = _getint("MAX_ROWS", 40)
+MAX_ROWS           = _getint("MAX_ROWS", 40)   # safe if env is blank
 
-# HTTP / crawling
+# === HTTP / crawling ===
 HTTP_TIMEOUT       = _getint("HTTP_TIMEOUT", 15)
-TIMEOUT            = HTTP_TIMEOUT  # backward compat
-USER_AGENT         = _getenv("USER_AGENT", "Mozilla/5.0 (compatible; chuckl-bot/1.0; +https://example.com/bot)")
+TIMEOUT            = HTTP_TIMEOUT                          # backward compat
+USER_AGENT         = _getenv("USER_AGENT", "Mozilla/5.0 (compatible; chuckl-bot/1.0)")
+FETCH_DELAY_MS     = _getint("FETCH_DELAY_MS", 250)        # NEW: politely space requests
+FETCH_MAX_RETRIES  = _getint("FETCH_MAX_RETRIES", 3)       # NEW: retry on transient errors
+RESPECT_ROBOTS     = _getbool("RESPECT_ROBOTS", False)     # optional toggle
+MAX_PAGES_PER_SITE = _getint("MAX_PAGES_PER_SITE", 25)
 
 # Paths we try on a site for contact pages
 CONTACT_PATHS = [
@@ -40,7 +45,7 @@ CONTACT_PATHS = [
 PREFER_COMPANY_DOMAIN = _getbool("PREFER_COMPANY_DOMAIN", True)
 
 # When we must guess a generic address at a domain
-GENERIC_GUESS_PREFIXES = ["info", "hello", "contact", "support", "enquiries", "enquiry", "sales", "enquiries"]
+GENERIC_GUESS_PREFIXES = ["info", "hello", "contact", "support", "enquiries", "enquiry", "sales"]
 # Back-compat alias for older imports
 GUESS_GENERICS = GENERIC_GUESS_PREFIXES
 
@@ -54,7 +59,7 @@ BAD_HOSTS = [
     "amazon.com", "amazon.co.uk", "aws.amazon.com",
 ]
 
-# (Optional) Good TLDs preference (not strictly required)
+# Optional: TLD preference (used by some filters—non-critical)
 GOOD_TLDS = ["com", "co.uk", "org", "net", "io"]
 
 # === Google Custom Search ===
@@ -68,6 +73,3 @@ MAX_GOOGLE_CANDIDATES     = _getint("MAX_GOOGLE_CANDIDATES", 8)
 BING_API_KEY              = _getenv("BING_API_KEY", "")
 SCRAPERAPI_KEY            = _getenv("SCRAPERAPI_KEY", "")
 SCRAPERAPI_RENDER         = _getbool("SCRAPERAPI_RENDER", False)
-
-# Crawl filtering
-MAX_PAGES_PER_SITE        = _getint("MAX_PAGES_PER_SITE", 25)
