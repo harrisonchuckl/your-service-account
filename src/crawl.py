@@ -1,198 +1,148 @@
 # src/crawl.py
 from __future__ import annotations
-
-import logging
-import time
-import re
-from collections import deque
-from dataclasses import dataclass
-from typing import Iterable, List, Set, Tuple
-from urllib.parse import urljoin, urlparse, urlunparse
-
+import logging, time, re
+from urllib.parse import urljoin, urlparse
 import requests
-from bs4 import BeautifulSoup
-
 from .config import (
-    USER_AGENT,
-    HTTP_TIMEOUT,
-    FETCH_DELAY_MS,
-    MAX_PAGES_PER_SITE,
-    MIN_PAGES_BEFORE_FALLBACK,
-    SITE_BUDGET_SECONDS,
-    CONTACT_PATHS,
-    CONTACT_KEYWORDS,
-    BAD_EXTENSIONS,
-    BAD_PATH_SNIPPETS,
-    SCRAPERAPI_KEY,
-    SCRAPERAPI_BASE,
-    SCRAPERAPI_COUNTRY,
-    SCRAPERAPI_RENDER,
+    HEADERS, HTTP_TIMEOUT, FETCH_DELAY_MS, MAX_PAGES_PER_SITE,
+    MIN_PAGES_BEFORE_FALLBACK, BAD_EXTENSIONS, BAD_PATH_SNIPPETS,
+    CONTACT_PATHS, SITE_BUDGET_SECONDS,
+    SCRAPERAPI_KEY, SCRAPERAPI_BASE, SCRAPERAPI_COUNTRY, SCRAPERAPI_RENDER,
 )
 
-log = logging.getLogger(__name__)
+# Single session for connection reuse
+_session = requests.Session()
+_session.headers.update(HEADERS)
 
-# ---------- Helpers
-
-def _canonical(u: str) -> str:
-    """Normalise URL for deduping and host checks."""
-    try:
-        p = urlparse(u)
-        # Strip fragments & default ports
-        netloc = p.hostname or ""
-        if p.port and p.port not in (80, 443):
-            netloc = f"{netloc}:{p.port}"
-        return urlunparse((p.scheme or "https", netloc, p.path or "/", "", p.query, ""))
-    except Exception:
-        return u
+def _ok(url: str) -> bool:
+    ul = url.lower()
+    if any(ext for ext in BAD_EXTENSIONS if ul.endswith(ext)):
+        return False
+    if any(sn in ul for sn in BAD_PATH_SNIPPETS):
+        return False
+    return True
 
 def _same_host(a: str, b: str) -> bool:
     try:
-        ha = urlparse(a).hostname or ""
-        hb = urlparse(b).hostname or ""
-        return ha.lower() == hb.lower()
+        ah = urlparse(a).netloc.split(":")[0].lower()
+        bh = urlparse(b).netloc.split(":")[0].lower()
+        return ah.endswith(bh)
     except Exception:
         return False
 
-def _is_bad_path(path: str) -> bool:
-    path_lower = path.lower()
-    if any(path_lower.endswith(ext) for ext in BAD_EXTENSIONS):
-        return True
-    if any(snippet in path_lower for snippet in BAD_PATH_SNIPPETS):
-        return True
-    return False
+def _norm(base: str, href: str) -> str | None:
+    try:
+        u = urljoin(base, href)
+        p = urlparse(u)
+        if p.scheme not in ("http", "https"):
+            return None
+        # strip fragment
+        return u.split("#")[0]
+    except Exception:
+        return None
 
-def _score_link(href: str) -> int:
-    """
-    Higher score = crawl sooner. Contact-like URLs first, then about/privacy,
-    then short, shallow paths. Penalise deep/asset paths.
-    """
-    pth = urlparse(href).path.lower()
-    score = 0
-    # Top priority: contact-ish
-    for pat in CONTACT_PATHS:
-        if re.search(pat, pth):
-            score += 100
-            break
-    # Secondary: typical info pages
-    if any(x in pth for x in ("/about", "/team", "/impressum", "/privacy", "/legal")):
-        score += 25
-    # Short & shallow boost
-    depth = pth.count("/")
-    score += max(0, 10 - depth)
-    # Penalise clearly static-ish paths
-    if _is_bad_path(pth):
-        score -= 50
-    return score
-
-def _extract_links(base_url: str, html: str) -> List[str]:
-    soup = BeautifulSoup(html, "html.parser")
-    links = set()
-    for a in soup.find_all("a", href=True):
-        href = a["href"].strip()
-        if href.startswith(("mailto:", "tel:", "javascript:", "#")):
-            continue
-        abs_url = urljoin(base_url, href)
-        links.add(abs_url)
-    return list(links)
-
-def _client_headers() -> dict:
-    return {"User-Agent": USER_AGENT, "Accept": "text/html,application/xhtml+xml"}
-
-def _scraperapi_url(target: str) -> str:
-    params = {
-        "api_key": SCRAPERAPI_KEY,
-        "url": target,
-    }
-    if SCRAPERAPI_COUNTRY:
-        params["country_code"] = SCRAPERAPI_COUNTRY
+def _scraperapi(url: str) -> str:
+    if not SCRAPERAPI_KEY:
+        return url
+    from urllib.parse import urlencode
+    params = {"api_key": SCRAPERAPI_KEY, "url": url}
     if SCRAPERAPI_RENDER:
         params["render"] = "true"
-    # Build querystring manually to avoid extra deps
-    from urllib.parse import urlencode
-    return f"{SCRAPERAPI_BASE}?{urlencode(params)}"
-
-# ---------- Public API
+    if SCRAPERAPI_COUNTRY:
+        params["country_code"] = SCRAPERAPI_COUNTRY
+    return f"{SCRAPERAPI_BASE.rstrip('/')}/?{urlencode(params)}"
 
 def fetch(url: str) -> str | None:
     """
-    Fetch a single URL and return text HTML, or None on failure.
-    Uses ScraperAPI if configured, otherwise direct requests.
+    Fetch a page and return HTML TEXT (string) or None on error.
+    IMPORTANT: returns ONLY the HTML string (no tuples), so callers like
+    extract.extract_contacts(html, base_url=...) get the right type.
     """
     try:
-        target = url
-        if SCRAPERAPI_KEY:
-            target = _scraperapi_url(url)
-        r = requests.get(target, headers=_client_headers(), timeout=HTTP_TIMEOUT, allow_redirects=True)
-        ct = r.headers.get("Content-Type", "")
-        if "text/html" not in ct and "application/xhtml+xml" not in ct:
-            return None
+        target = _scraperapi(url)
+        r = _session.get(target, timeout=HTTP_TIMEOUT, allow_redirects=True)
         r.raise_for_status()
         return r.text
     except Exception as e:
-        log.info("Fetch failed for %s: %s", url, e)
+        logging.info("Skip %s: %s", url, e)
         return None
 
-def crawl_candidate_pages(start_url: str) -> List[Tuple[str, str]]:
+def crawl_candidate_pages(base_url: str, max_pages: int = 8) -> dict[str, str]:
     """
-    Breadth-first crawl of same-host pages, prioritising ‘contact-ish’ paths.
-    Returns list of (url, html) limited by MAX_PAGES_PER_SITE and time budget.
+    Try high-signal paths first (contact, help, about, etc).
+    Returns {url: html} for any that load.
     """
-    start_ts = time.time()
-    out: List[Tuple[str, str]] = []
-    seen: Set[str] = set()
-    q: deque[str] = deque()
+    out: dict[str, str] = {}
+    tried = 0
+    for pat in CONTACT_PATHS:
+        if tried >= max_pages:
+            break
+        path = pat if pat.startswith("/") else f"/{pat}"
+        url = urljoin(base_url, path)
+        if not _ok(url):
+            continue
+        html = fetch(url)
+        tried += 1
+        if html:
+            out[url] = html
+        time.sleep(FETCH_DELAY_MS / 1000.0)
+    return out
 
-    root = _canonical(start_url)
-    q.append(root)
-    seen.add(_canonical(root))
+def crawl_site(base_url: str) -> dict[str, str]:
+    """
+    Polite, bounded BFS crawl:
+    - Hard cap by MAX_PAGES_PER_SITE and SITE_BUDGET_SECONDS
+    - Prioritise likely contact pages
+    - Stop early once we’ve crawled a few pages and a contact-like URL exists
+    Returns {url: html}
+    """
+    start = time.monotonic()
+    seen: set[str] = set()
+    q: list[str] = [base_url]
+    pages: dict[str, str] = {}
 
-    pages_fetched = 0
-    min_pages = max(1, MIN_PAGES_BEFORE_FALLBACK)
+    # Seed with candidate “contact-ish” pages
+    seeded = crawl_candidate_pages(base_url, max_pages=min(6, MAX_PAGES_PER_SITE))
+    pages.update(seeded)
+    seen.update(seeded.keys())
 
-    while q and pages_fetched < MAX_PAGES_PER_SITE:
-        # Time budget guard
-        if time.time() - start_ts > SITE_BUDGET_SECONDS:
-            log.info("[INFO] Time budget hit (%.1fs); stopping site crawl.", SITE_BUDGET_SECONDS)
+    while q and len(pages) < MAX_PAGES_PER_SITE:
+        if time.monotonic() - start > SITE_BUDGET_SECONDS:
+            logging.info("⏳ Site budget reached for %s (%d pages).", base_url, len(pages))
             break
 
-        url = q.popleft()
+        url = q.pop(0)
+        if url in seen:
+            continue
+        seen.add(url)
+
+        if not _same_host(url, base_url) or not _ok(url):
+            continue
 
         html = fetch(url)
         if not html:
             continue
 
-        out.append((url, html))
-        pages_fetched += 1
+        pages[url] = html
 
-        # Collect internal links, score, and enqueue
-        links = _extract_links(url, html)
-        internal = [u for u in links if _same_host(u, root)]
-        # De-dupe and filter obviously bad
-        next_links = []
-        for u in internal:
-            cu = _canonical(u)
-            if cu in seen:
-                continue
-            if _is_bad_path(urlparse(cu).path):
-                continue
-            seen.add(cu)
-            next_links.append(cu)
+        # Extract and queue in-domain links (lightweight)
+        try:
+            for href in re.findall(r'href=["\']([^"\']+)["\']', html, flags=re.IGNORECASE):
+                u = _norm(url, href)
+                if not u or u in seen:
+                    continue
+                if not _same_host(u, base_url) or not _ok(u):
+                    continue
+                q.append(u)
+        except Exception:
+            pass
 
-        # Prioritise by score (higher first)
-        next_links.sort(key=_score_link, reverse=True)
-        for u in next_links:
-            q.append(u)
+        time.sleep(FETCH_DELAY_MS / 1000.0)
 
-        # Gentle politeness
-        if FETCH_DELAY_MS > 0:
-            time.sleep(FETCH_DELAY_MS / 1000.0)
+        # If we’ve crawled a few pages and any page path matches contact patterns, stop
+        if len(pages) >= MIN_PAGES_BEFORE_FALLBACK:
+            if any(re.search(pat, p, flags=re.IGNORECASE) for p in pages for pat in CONTACT_PATHS):
+                break
 
-        # Keep going until limits/time; the caller decides when to stop based on findings
-        # We purposely do NOT bail early here; extraction decides when it's “good enough”.
-
-    # Ensure we at least tried a few pages before the caller falls back to Google
-    if len(out) < min_pages:
-        log.info("[INFO] Only crawled %d page(s) on %s (min before fallback: %d).",
-                 len(out), start_url, min_pages)
-
-    return out
+    logging.info("Crawled %d pages on %s", len(pages), base_url)
+    return pages
