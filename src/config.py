@@ -38,32 +38,22 @@ def _getlist(name: str, default: List[str]) -> List[str]:
 # -----------------------------
 # General HTTP / crawling
 # -----------------------------
-USER_AGENT         = _getenv("USER_AGENT", "Mozilla/5.0 (compatible; ChucklBot/1.0; +https://example.com/bot)")
+USER_AGENT         = _getenv("USER_AGENT", "Mozilla/5.0 (compatible; ChucklBot/1.0)")
 HTTP_TIMEOUT       = _getint("HTTP_TIMEOUT", 15)      # seconds
-TIMEOUT            = HTTP_TIMEOUT                      # alias for older imports
-FETCH_DELAY_MS     = _getint("FETCH_DELAY_MS", 400)    # ms between fetches
+TIMEOUT            = HTTP_TIMEOUT                     # alias for older imports
+FETCH_DELAY_MS     = _getint("FETCH_DELAY_MS", 400)   # ms between fetches
 MAX_PAGES_PER_SITE = _getint("MAX_PAGES_PER_SITE", 20)
 
 # Common paths to probe on a site root for contact info
 CONTACT_PATHS = [
-    "/contact",
-    "/contact/",
-    "/contact-us",
-    "/contact-us/",
-    "/contactus",
-    "/get-in-touch",
-    "/getintouch",
-    "/support",
-    "/help",
-    "/find-us",
-    "/where-to-find-us",
-    "/about",
-    "/about-us",
+    "/contact", "/contact/", "/contact-us", "/contact-us/", "/contactus",
+    "/get-in-touch", "/getintouch",
+    "/support", "/help",
+    "/find-us", "/where-to-find-us",
+    "/about", "/about-us",
     "/company/contact",
-    "/privacy",
-    "/privacy-policy",
-    "/imprint",
-    "/impressum",
+    "/privacy", "/privacy-policy",
+    "/imprint", "/impressum",
     "/team",
 ]
 
@@ -85,6 +75,9 @@ GOOGLE_CSE_MAX_RETRIES    = _getint("GOOGLE_CSE_MAX_RETRIES", 5)
 
 BING_API_KEY              = _getenv("BING_API_KEY", "")
 
+# How many candidate search results to consider when resolving “official site”
+MAX_GOOGLE_CANDIDATES     = _getint("MAX_GOOGLE_CANDIDATES", 6)
+
 # Skip sending us to generic/low-signal destinations in search results
 # You can also override/extend via env BAD_HOSTS="facebook.com,linkedin.com,..."
 BAD_HOSTS: List[str] = _getlist(
@@ -92,7 +85,7 @@ BAD_HOSTS: List[str] = _getlist(
     [
         "facebook.com", "linkedin.com", "twitter.com", "instagram.com", "youtube.com",
         "wikipedia.org", "reddit.com", "medium.com", "blogspot.com", "wordpress.com",
-        "typepad.com", "pinterest.com", "foursquare.com", "yelp.com", "fda.gov"
+        "typepad.com", "pinterest.com", "foursquare.com", "yelp.com", "fda.gov",
     ],
 )
 
@@ -122,12 +115,11 @@ SHEET_TAB                = _getenv("SHEET_TAB", "Sheet1")
 # Export convenience
 # -----------------------------
 __all__ = [
-    # helpers are intentionally not exported
     "USER_AGENT", "HTTP_TIMEOUT", "TIMEOUT", "FETCH_DELAY_MS", "MAX_PAGES_PER_SITE",
     "CONTACT_PATHS",
     "SCRAPERAPI_KEY", "SCRAPERAPI_BASE", "SCRAPERAPI_RENDER", "SCRAPERAPI_COUNTRY",
     "GOOGLE_CSE_KEY", "GOOGLE_CSE_CX", "GOOGLE_CSE_QPS_DELAY_MS", "GOOGLE_CSE_MAX_RETRIES",
-    "BING_API_KEY", "BAD_HOSTS",
+    "BING_API_KEY", "MAX_GOOGLE_CANDIDATES", "BAD_HOSTS",
     "DEFAULT_LOCATION", "MAX_ROWS",
     "PREFER_COMPANY_DOMAIN", "GUESS_GENERICS", "GENERIC_GUESS_PREFIXES",
     "SHEET_ID", "SHEET_TAB",
