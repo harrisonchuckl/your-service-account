@@ -28,8 +28,8 @@ MAX_ROWS           = _getint("MAX_ROWS", 40)   # safe if env is blank
 HTTP_TIMEOUT       = _getint("HTTP_TIMEOUT", 15)
 TIMEOUT            = HTTP_TIMEOUT                          # backward compat
 USER_AGENT         = _getenv("USER_AGENT", "Mozilla/5.0 (compatible; chuckl-bot/1.0)")
-FETCH_DELAY_MS     = _getint("FETCH_DELAY_MS", 250)        # NEW: politely space requests
-FETCH_MAX_RETRIES  = _getint("FETCH_MAX_RETRIES", 3)       # NEW: retry on transient errors
+FETCH_DELAY_MS     = _getint("FETCH_DELAY_MS", 250)        # space requests politely
+FETCH_MAX_RETRIES  = _getint("FETCH_MAX_RETRIES", 3)       # retry on transient errors
 RESPECT_ROBOTS     = _getbool("RESPECT_ROBOTS", False)     # optional toggle
 MAX_PAGES_PER_SITE = _getint("MAX_PAGES_PER_SITE", 25)
 
@@ -49,7 +49,7 @@ GENERIC_GUESS_PREFIXES = ["info", "hello", "contact", "support", "enquiries", "e
 # Back-compat alias for older imports
 GUESS_GENERICS = GENERIC_GUESS_PREFIXES
 
-# Domains to skip (generic hosts, social networks, marketplaces, big govt portals, etc.)
+# Skip generic/irrelevant hosts (social, marketplaces, large portals, etc.)
 BAD_HOSTS = [
     "facebook.com", "linkedin.com", "twitter.com", "x.com", "instagram.com", "youtube.com",
     "wikipedia.org", "reddit.com", "medium.com", "blogspot.com", "wordpress.com", "typepad.com",
@@ -59,7 +59,7 @@ BAD_HOSTS = [
     "amazon.com", "amazon.co.uk", "aws.amazon.com",
 ]
 
-# Optional: TLD preference (used by some filters—non-critical)
+# Optional: TLD preference (non-critical)
 GOOD_TLDS = ["com", "co.uk", "org", "net", "io"]
 
 # === Google Custom Search ===
@@ -71,5 +71,10 @@ MAX_GOOGLE_CANDIDATES     = _getint("MAX_GOOGLE_CANDIDATES", 8)
 
 # === Optional fallback providers ===
 BING_API_KEY              = _getenv("BING_API_KEY", "")
+
+# ScraperAPI settings (for dynamic sites)
 SCRAPERAPI_KEY            = _getenv("SCRAPERAPI_KEY", "")
 SCRAPERAPI_RENDER         = _getbool("SCRAPERAPI_RENDER", False)
+SCRAPERAPI_BASE           = _getenv("SCRAPERAPI_BASE", "https://api.scraperapi.com")
+# If you want geo routing, you can also set (not required by the code unless you use it):
+SCRAPERAPI_COUNTRY        = _getenv("SCRAPERAPI_COUNTRY", "")  # e.g., "uk", "us"
