@@ -1,128 +1,183 @@
 # src/extract.py
 from __future__ import annotations
+
 import re
-from urllib.parse import urljoin
+from html import unescape
+from typing import Dict, List, Optional, Set, Tuple
+from urllib.parse import urljoin, urlparse
+
 from bs4 import BeautifulSoup
-from typing import Any, Dict, List, Tuple, Optional
 
-# Simple email regex (good enough for web scraping)
-EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", re.I)
-
-CONTACT_HINTS = (
-    "contact", "enquiry", "inquiry", "support", "help", "get-in-touch", "feedback",
-    "sales", "customer", "service", "reach", "connect"
+from .config import (
+    EMAIL_RE,
+    MAILTO_RE,
+    CONTACT_FORM_HINTS,
+    FORM_REQUIRE_FIELDS_ANY,
+    FORM_REQUIRE_FIELDS_ALL,
+    PREFER_COMPANY_DOMAIN,
+    EMAIL_GUESS_ENABLE,
+    GENERIC_GUESS_PREFIXES,
+    BAD_HOSTS,
 )
 
-def _ensure_text(html: Any) -> str:
-    if html is None:
+def _domain(host_or_url: str) -> str:
+    try:
+        host = urlparse(host_or_url).hostname or host_or_url
+        return host.lower()
+    except Exception:
+        return host_or_url.lower()
+
+def _same_domain(a: str, b: str) -> bool:
+    return _domain(a) == _domain(b)
+
+def _decode_cfemail(encoded: str) -> str:
+    """
+    Cloudflare email obfuscation decoder.
+    `encoded` should be hex string after data-cfemail attribute.
+    """
+    try:
+        r = int(encoded[:2], 16)
+        out = "".join(chr(int(encoded[i : i + 2], 16) ^ r) for i in range(2, len(encoded), 2))
+        return out
+    except Exception:
         return ""
-    if isinstance(html, bytes):
-        try:
-            return html.decode("utf-8", errors="ignore")
-        except Exception:
-            return html.decode(errors="ignore")
-    return str(html)
 
-def _dedupe(seq):
-    seen = set()
-    out = []
-    for x in seq:
-        if x not in seen:
-            seen.add(x)
-            out.append(x)
-    return out
+def _gather_emails(html: str) -> Set[str]:
+    emails: Set[str] = set()
 
-def _extract_emails_from_text(text: str) -> List[str]:
-    return _dedupe([m.group(0) for m in EMAIL_RE.finditer(text)])
-
-def _extract_emails(soup: BeautifulSoup) -> List[str]:
-    emails: List[str] = []
-    # mailto: links
-    for a in soup.select('a[href^="mailto:"]'):
-        href = a.get("href", "")
-        addr = href.split("mailto:", 1)[-1].split("?")[0].strip()
+    # 1) mailto: links
+    for m in MAILTO_RE.finditer(html):
+        addr = m.group(1)
         if addr:
-            emails.append(addr)
-    # visible text
-    emails.extend(_extract_emails_from_text(soup.get_text(" ", strip=True)))
-    # Meta tags sometimes hide emails
-    for tag in soup.find_all(["meta", "script"]):
-        content = (tag.get("content") or tag.string or "") or ""
-        if content:
-            emails.extend(_extract_emails_from_text(content))
-    # Clean+dedupe
-    emails = [e.strip().strip(".,;:()[]{}<>") for e in emails if "@" in e]
-    emails = [e.lower() for e in emails]
-    return _dedupe(emails)
+            emails.add(addr.strip())
 
-def _extract_forms(soup: BeautifulSoup, base_url: Optional[str]) -> List[str]:
-    actions: List[str] = []
-    # Form actions
-    for f in soup.find_all("form"):
-        action = (f.get("action") or "").strip()
-        if not action:
+    # 2) direct emails in text
+    for m in EMAIL_RE.finditer(html):
+        emails.add(m.group(0).strip())
+
+    # 3) Cloudflare obfuscation
+    # data-cfemail="HEX"
+    for m in re.finditer(r'data-cfemail="([0-9a-fA-F]+)"', html):
+        decoded = _decode_cfemail(m.group(1))
+        if decoded and "@" in decoded:
+            emails.add(decoded.strip())
+
+    return emails
+
+def _prefer_domain(emails: Set[str], preferred_domain: Optional[str]) -> Optional[str]:
+    if not emails:
+        return None
+    if preferred_domain:
+        pd = _domain(preferred_domain)
+        same = [e for e in emails if _domain(e.split("@")[-1]) == pd]
+        if same:
+            return sorted(same, key=len)[0]
+    # else return the shortest-looking businessy address
+    # Avoid obvious no-reply types
+    ranked = sorted(
+        emails,
+        key=lambda e: (
+            any(x in e for x in ("noreply", "no-reply", "do-not-reply")),
+            len(e),
+        ),
+    )
+    return ranked[0] if ranked else None
+
+def _find_contact_forms(base_url: str, soup: BeautifulSoup) -> List[str]:
+    forms: List[str] = []
+    # Any explicit contact-page hint in headings / hero text
+    text = soup.get_text(" ", strip=True).lower()
+    if any(k in text for k in ("contact us", "get in touch", "enquire", "enquiry", "email us")):
+        pass  # just a soft signal; the actual form detection is below
+
+    for form in soup.find_all("form"):
+        form_text = form.get_text(" ", strip=True).lower()
+        attrs = " ".join(f"{k}={v}" for k, v in form.attrs.items()).lower()
+        # quick hints (plugins, etc.)
+        if any(h in attrs or h in form_text for h in CONTACT_FORM_HINTS):
+            forms.append(base_url)
             continue
-        if base_url:
-            action = urljoin(base_url, action)
-        actions.append(action)
-    # Links that look like “contact” pages
-    for a in soup.find_all("a"):
-        href = (a.get("href") or "").strip()
-        if not href:
-            continue
+
+        # look for required fields
+        inputs = " ".join(
+            [
+                (inp.get("name") or "") + " " + (inp.get("id") or "") + " " + (inp.get("placeholder") or "")
+                for inp in form.find_all(["input", "textarea", "select"])
+            ]
+        ).lower()
+
+        any_ok = any(any_key in inputs for any_key in FORM_REQUIRE_FIELDS_ANY)
+        all_ok = all(all_key in inputs for all_key in FORM_REQUIRE_FIELDS_ALL)
+        if any_ok and all_ok:
+            forms.append(base_url)
+
+    # also consider explicit “contact” links on the page pointing to another URL
+    for a in soup.find_all("a", href=True):
         label = (a.get_text(" ", strip=True) or "").lower()
-        href_l = href.lower()
-        looks_contact = any(h in href_l for h in CONTACT_HINTS) or any(h in label for h in CONTACT_HINTS)
-        if looks_contact:
-            if base_url:
-                href = urljoin(base_url, href)
-            actions.append(href)
-    # Keep only distinct, http(s) targets
-    actions = [u for u in actions if u.startswith("http")]
-    return _dedupe(actions)
+        href = a["href"]
+        if any(k in label for k in ("contact", "enquire", "get in touch")):
+            absu = urljoin(base_url, href)
+            forms.append(absu)
 
-def extract_contacts(
-    html_or_tuple: Any,
-    base_url: Optional[str] = None,
-    **_ignore_kwargs: Any,  # swallows legacy kwargs like preferred_domain
-) -> Dict[str, Any]:
+    # de-dup keeping order
+    seen = set()
+    ordered = []
+    for u in forms:
+        if u not in seen:
+            ordered.append(u)
+            seen.add(u)
+    return ordered
+
+def _safe_guess(preferred_domain: Optional[str], company: Optional[str]) -> Optional[str]:
+    if not EMAIL_GUESS_ENABLE or not preferred_domain:
+        return None
+    dom = _domain(preferred_domain)
+    if any(bad in dom for bad in BAD_HOSTS):
+        return None
+    guesses = [f"{p}@{dom}" for p in GENERIC_GUESS_PREFIXES]
+    # a tiny nod to “company-ish” match: prefer ‘info@’ only
+    return guesses[0] if guesses else None
+
+def extract_contacts(html: str, base_url: str, preferred_domain: Optional[str] = None, company: Optional[str] = None) -> Dict[str, Optional[str] | List[str]]:
     """
-    Backward-compatible extractor.
-
-    Accepts:
-      - extract_contacts(html)
-      - extract_contacts(html, base_url)
-      - extract_contacts((html, base_url))
-      - extract_contacts(html, base_url, preferred_domain=...)
-    Returns:
-      {
-        "emails": [str, ...],
-        "forms": [str, ...],
-        # single-item aliases for older callers:
-        "email": Optional[str],
-        "form": Optional[str],
-        "notes": [str, ...]
-      }
+    Parse one HTML page. Return a dict with:
+      - emails: list[str]
+      - forms: list[str]
+      - email (alias of best_email)
+      - form_url (alias of best_form)
     """
-    # Legacy: (html, base_url) passed as a single tuple
-    if isinstance(html_or_tuple, tuple) and len(html_or_tuple) >= 1 and base_url is None:
-        html_or_tuple = list(html_or_tuple)  # type: ignore
-        _html = _ensure_text(html_or_tuple[0])
-        _base = html_or_tuple[1] if len(html_or_tuple) > 1 else None
-    else:
-        _html = _ensure_text(html_or_tuple)
-        _base = base_url
+    # html may sometimes arrive as bytes; force to str
+    if isinstance(html, (bytes, bytearray)):
+        html = html.decode("utf-8", errors="ignore")
 
-    soup = BeautifulSoup(_html, "html.parser")
+    soup = BeautifulSoup(html, "html.parser")
+    raw = soup.decode()
 
-    emails = _extract_emails(soup)
-    forms = _extract_forms(soup, _base)
+    emails = _gather_emails(raw)
 
-    result: Dict[str, Any] = {
-        "emails": emails,
+    # If we prefer the site’s domain, filter to that first
+    if PREFER_COMPANY_DOMAIN and preferred_domain:
+        dom = _domain(preferred_domain)
+        emails = {e for e in emails if e.split("@")[-1].lower().endswith(dom)}
+
+    best_email = _prefer_domain(emails, preferred_domain)
+    forms = _find_contact_forms(base_url, soup)
+    best_form = forms[0] if forms else None
+
+    # last-ditch: a very conservative guess (only if enabled)
+    guessed = None
+    if not best_email and not best_form:
+        guessed = _safe_guess(preferred_domain, company)
+
+    # Provide both detailed lists and convenient aliases
+    result = {
+        "emails": sorted(emails),
         "forms": forms,
-        "email": emails[0] if emails else None,
-        "form": forms[0] if forms else None,
-        "notes": [],
+        "best_email": best_email,
+        "best_form": best_form,
+        # Aliases for existing code paths:
+        "email": best_email,
+        "form_url": best_form,
+        "guessed_email": guessed,
     }
     return result
