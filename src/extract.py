@@ -1,125 +1,179 @@
-import re, json
-from html import unescape
+# src/extract.py
+from __future__ import annotations
+
+import re
+from typing import Dict, List, Set, Tuple, Iterable, Optional, Union
+from urllib.parse import urljoin, urlparse
+
 from bs4 import BeautifulSoup
 
-EMAIL_RE = re.compile(r"[a-zA-Z0-9_.+-]+@(?:[a-zA-Z0-9-]+\.)+[a-zA-Z]{2,}", re.I)
+EMAIL_RE = re.compile(
+    r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}",
+    re.IGNORECASE,
+)
 
-GENERIC_PRIORITY = [
-    "info@", "hello@", "contact@", "enquiries@", "enquiry@", "boxoffice@",
-    "bookings@", "sales@", "admin@", "office@", "support@", "team@", "press@", "media@", "privacy@", "dataprotection@", "dpo@"
-]
+# Skip obviously junk/placeholder emails
+BAD_EMAIL_SUFFIXES = {
+    ".invalid", ".test", ".example"
+}
+BAD_EMAIL_PARTS = {
+    "example@", "noreply@", "no-reply@", "donotreply@", "do-not-reply@"
+}
 
-BAD_PREFIXES = ["example@", "test@", "noreply@", "no-reply@", "donotreply@"]
 
-def _is_valid_email(email: str) -> bool:
-    e = (email or "").lower()
-    return bool(e) and not any(b in e for b in BAD_PREFIXES)
+def _normalize_html(doc: Union[str, bytes, Tuple, None]) -> str:
+    """
+    Accepts:
+      - str HTML
+      - bytes HTML
+      - tuple where first element is HTML (e.g., (html, final_url) or (html, ...))
+      - None
+    Returns a safe string (possibly empty).
+    """
+    if isinstance(doc, tuple):
+        # Heuristic: first string/bytes-ish entry is the html
+        for part in doc:
+            if isinstance(part, (str, bytes)):
+                doc = part
+                break
 
-def _score_email(email: str, source_url: str, page_text_lower: str, preferred_domain: str = None, location: str = None) -> int:
-    score = 0
-    e = (email or "").lower()
-    src = (source_url or "").lower()
+    if doc is None:
+        return ""
 
-    if preferred_domain and e.split("@")[-1].endswith(preferred_domain):
-        score += 3
-    if any(e.startswith(p) for p in GENERIC_PRIORITY):
-        score += 2
-    if location and location.lower() in page_text_lower:
-        score += 1
-    if "contact" in src:
-        score += 1
-    return score
-
-_OBFUSCATE_PATTERNS = [
-    (re.compile(r"\s*(?:\(|\[)?at(?:\)|\])\s*", re.I), "@"),
-    (re.compile(r"\s*(?:\(|\[)?\[?@(?:\)|\])?\s*", re.I), "@"),
-    (re.compile(r"\s*(?:\(|\[)?dot(?:\)|\])\s*", re.I), "."),
-    (re.compile(r"\s*\(dot\)\s*", re.I), "."),
-    (re.compile(r"\s*\[dot\]\s*", re.I), "."),
-]
-
-def _deobfuscate(text: str) -> str:
-    s = unescape(text or "")
-    for rx, repl in _OBFUSCATE_PATTERNS:
-        s = rx.sub(repl, s)
-    return s
-
-def _emails_from_text(s: str):
-    return EMAIL_RE.findall(s or "")
-
-def _emails_from_json_ld(soup: BeautifulSoup):
-    emails = []
-    for tag in soup.find_all("script", attrs={"type": "application/ld+json"}):
+    if isinstance(doc, bytes):
         try:
-            data = json.loads(tag.string or "{}")
+            return doc.decode("utf-8", "ignore")
         except Exception:
+            return ""
+
+    if isinstance(doc, str):
+        return doc
+
+    # Anything else we don't recognize
+    return ""
+
+
+def _clean_email(e: str) -> Optional[str]:
+    e = e.strip().strip(".,;:()[]{}<>")
+    # lower for checks but return original casing (most MTAs are case-insensitive)
+    el = e.lower()
+    if any(el.endswith(sfx) for sfx in BAD_EMAIL_SUFFIXES):
+        return None
+    if any(p in el for p in BAD_EMAIL_PARTS):
+        return None
+    # Basic sanity: must still match full regex
+    m = EMAIL_RE.fullmatch(e) or EMAIL_RE.fullmatch(el)
+    return e if m else None
+
+
+def _dedupe_preserve_order(items: Iterable[str]) -> List[str]:
+    seen: Set[str] = set()
+    out: List[str] = []
+    for it in items:
+        if it not in seen:
+            out.append(it)
+            seen.add(it)
+    return out
+
+
+def _extract_mailtos(soup: BeautifulSoup, base_url: str) -> List[Tuple[str, str]]:
+    found: List[Tuple[str, str]] = []
+    for a in soup.find_all("a", href=True):
+        href = (a.get("href") or "").strip()
+        if href.lower().startswith("mailto:"):
+            email = href.split(":", 1)[1].split("?")[0].strip()
+            email = _clean_email(email) or ""
+            if email:
+                found.append((email, base_url))
+    return found
+
+
+def _extract_emails_text(soup: BeautifulSoup, base_url: str) -> List[Tuple[str, str]]:
+    # Search visible text for emails
+    text = soup.get_text(" ", strip=True) if soup else ""
+    emails = EMAIL_RE.findall(text) if text else []
+    cleaned = []
+    for e in emails:
+        ce = _clean_email(e)
+        if ce:
+            cleaned.append((ce, base_url))
+    return cleaned
+
+
+def _looks_like_contact_form(form) -> bool:
+    """
+    Heuristic: form with an action containing 'contact', or contains inputs typical of contact forms.
+    """
+    action = (form.get("action") or "").lower()
+    if "contact" in action:
+        return True
+
+    # Look for fields frequently used in contact forms
+    inputs = [i.get("name", "").lower() for i in form.find_all(["input", "textarea", "select"])]
+    candidates = ("email", "message", "subject", "name", "company", "phone")
+    score = sum(1 for n in inputs if any(c in n for c in candidates))
+    return score >= 2
+
+
+def _extract_forms(soup: BeautifulSoup, base_url: str) -> List[Tuple[str, str]]:
+    forms: List[Tuple[str, str]] = []
+    if not soup:
+        return forms
+    for form in soup.find_all("form"):
+        if not _looks_like_contact_form(form):
             continue
-        def walk(obj):
-            if isinstance(obj, dict):
-                for k, v in obj.items():
-                    if k.lower() == "email" and isinstance(v, str):
-                        emails.append(v)
-                    else:
-                        walk(v)
-            elif isinstance(obj, list):
-                for it in obj:
-                    walk(it)
-        walk(data)
-    return [e for e in emails if _is_valid_email(e)]
+        action = (form.get("action") or "").strip()
+        if not action:
+            # form posts to same page
+            forms.append((base_url, base_url))
+            continue
+        try:
+            absolute = urljoin(base_url, action)
+        except Exception:
+            absolute = base_url
+        forms.append((absolute, base_url))
+    # Also catch obvious contact links masquerading as buttons
+    for a in soup.find_all("a", href=True):
+        txt = (a.get_text() or "").strip().lower()
+        if "contact" in txt:
+            try:
+                absolute = urljoin(base_url, a["href"])
+            except Exception:
+                absolute = base_url
+            forms.append((absolute, base_url))
+    # de-dupe
+    dedup: List[Tuple[str, str]] = []
+    seen: Set[Tuple[str, str]] = set()
+    for f in forms:
+        if f not in seen:
+            dedup.append(f)
+            seen.add(f)
+    return dedup
 
-def extract_contacts(html_by_url, preferred_domain=None, location=None):
+
+def extract_contacts(html_or_tuple: Union[str, bytes, Tuple, None], base_url: str) -> Dict[str, List[Tuple[str, str]]]:
     """
-    Given {url: html}, return best email + source and a contact form URL if seen.
+    Returns:
+      {
+        "emails": [(email, source_url), ...],
+        "forms":  [(form_url, source_url), ...]
+      }
     """
-    best_email, best_src, best_score = None, None, -1
-    form_url = None
+    html = _normalize_html(html_or_tuple)
+    soup = BeautifulSoup(html, "html.parser") if html else None
 
-    for url, html in html_by_url.items():
-        soup = BeautifulSoup(html, "html.parser")
+    emails = _extract_mailtos(soup, base_url) + _extract_emails_text(soup, base_url)
+    # De-dupe emails while preserving first-seen source
+    seen_e: Set[str] = set()
+    emails_dedup: List[Tuple[str, str]] = []
+    for e, src in emails:
+        if e not in seen_e:
+            emails_dedup.append((e, src))
+            seen_e.add(e)
 
-        # Whole-page text (once)
-        raw_text = soup.get_text(" ", strip=True)[:700000]
-        text = _deobfuscate(raw_text)
-        text_low = text.lower()
-
-        # (A) contact form / contact URL
-        if not form_url:
-            if "contact" in (url or "").lower():
-                form_url = url
-            else:
-                form = soup.find("form")
-                if form:
-                    id_txt = (form.get("id", "") or "").lower()
-                    cls_txt = " ".join(form.get("class", [])).lower() if isinstance(form.get("class", []), list) else str(form.get("class", "")).lower()
-                    if "contact" in id_txt or "contact" in cls_txt:
-                        form_url = url
-
-        # (B) mailto links
-        for a in soup.select('a[href^="mailto:"]'):
-            raw = (a.get("href") or "").replace("mailto:", "").split("?")[0].strip()
-            raw = _deobfuscate(raw)
-            if not _is_valid_email(raw):
-                continue
-            score = _score_email(raw, url, text_low, preferred_domain, location)
-            if score > best_score:
-                best_email, best_src, best_score = raw, url, score
-
-        # (C) JSON-LD "email" fields
-        for em in _emails_from_json_ld(soup):
-            score = _score_email(em, url, text_low, preferred_domain, location)
-            if score > best_score:
-                best_email, best_src, best_score = em, url, score
-
-        # (D) visible text emails (after deobfuscation)
-        for em in _emails_from_text(text):
-            if not _is_valid_email(em):
-                continue
-            score = _score_email(em, url, text_low, preferred_domain, location)
-            if score > best_score:
-                best_email, best_src, best_score = em, url, score
+    forms = _extract_forms(soup, base_url)
 
     return {
-        "ContactEmail": best_email or "",
-        "ContactFormURL": form_url or "",
-        "SourceURL": best_src or (form_url or "")
+        "emails": emails_dedup,
+        "forms": forms,
     }
