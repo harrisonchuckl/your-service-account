@@ -1,113 +1,108 @@
-import os
-import requests, tldextract
-from .logging_utils import get_logger
-from .config import BAD_HOSTS, DEFAULT_LOCATION
+# src/search.py
+import logging
+import time
+import random
+from urllib.parse import urlparse
 
-logger = get_logger("search")
+import requests
 
-GOOGLE_CSE_KEY = os.getenv("GOOGLE_CSE_KEY")
-GOOGLE_CSE_CX  = os.getenv("GOOGLE_CSE_CX")
-GOOGLE_ENDPOINT = "https://www.googleapis.com/customsearch/v1"
+from .config import (
+    BAD_HOSTS,
+    DEFAULT_LOCATION,  # not used here but kept for parity
+    GOOGLE_CSE_KEY,
+    GOOGLE_CSE_CX,
+    GOOGLE_CSE_QPS_DELAY_MS,
+    GOOGLE_CSE_MAX_RETRIES,
+)
 
-def find_official_site(company, domain_hint):
-    """Try to find the company's official root site."""
-    if domain_hint and "." in domain_hint:
-        url = normalize_site(f"https://{domain_hint}")
-        if url:
-            logger.info(f"[{company}] Using domain hint: {url}")
+_GOOGLE_ENDPOINT = "https://www.googleapis.com/customsearch/v1"
+
+def _host_ok(url: str) -> bool:
+    try:
+        host = urlparse(url).netloc.lower()
+    except Exception:
+        return False
+    if not host:
+        return False
+    return host not in BAD_HOSTS
+
+def _google_search(query: str, num: int = 5) -> list[str]:
+    """Call Google CSE with throttling + retry/backoff. Return list of links or [] on issues."""
+    if not GOOGLE_CSE_KEY or not GOOGLE_CSE_CX:
+        logging.info("[search] Google CSE not configured; skipping")
+        return []
+
+    params = {
+        "key": GOOGLE_CSE_KEY,  # already stripped in config
+        "cx": GOOGLE_CSE_CX,    # already stripped in config
+        "q": query,
+        "num": num,
+        "safe": "off",
+    }
+
+    delay = max(0, GOOGLE_CSE_QPS_DELAY_MS) / 1000.0
+
+    for attempt in range(GOOGLE_CSE_MAX_RETRIES):
+        try:
+            r = requests.get(_GOOGLE_ENDPOINT, params=params, timeout=20)
+            # Retry on common transient conditions
+            if r.status_code in (429, 500, 502, 503, 504):
+                wait = (2 ** attempt) + random.random()
+                logging.warning(f"[search] Google CSE {r.status_code}; backing off {wait:.1f}s (attempt {attempt+1})")
+                time.sleep(wait)
+                continue
+
+            r.raise_for_status()
+            data = r.json()
+            items = data.get("items", []) or []
+            links = [it.get("link") for it in items if it.get("link")]
+            time.sleep(delay)  # QPS pacing
+            return links
+
+        except requests.RequestException as e:
+            # Network/HTTP error: backoff and retry
+            wait = (2 ** attempt) + random.random()
+            logging.warning(f"[search] Exception {type(e).__name__}: {e}; backing off {wait:.1f}s (attempt {attempt+1})")
+            time.sleep(wait)
+
+    logging.warning("[search] Google CSE failed after retries; returning no results")
+    return []
+
+def _first_good_url(links: list[str]) -> str | None:
+    for url in links:
+        if _host_ok(url):
             return url
-
-    if GOOGLE_CSE_KEY and GOOGLE_CSE_CX:
-        queries = [
-            f"{company} {DEFAULT_LOCATION} official site",
-            f"{company} {DEFAULT_LOCATION}",
-            f"{company} website",
-            f"{company}"
-        ]
-        for q in queries:
-            url = _google_first_good_url(q)
-            if url:
-                logger.info(f"[{company}] Google resolved: {url}")
-                return url
-
-    logger.info(f"[{company}] No search provider configured or no result.")
     return None
 
-def google_contact_hunt(company, location=None, domain_for_site=None, limit=4):
-    """
-    Return up to `limit` URLs likely to show an email/contact.
-    Prefer site-scoped queries if we know the domain.
-    """
-    if not (GOOGLE_CSE_KEY and GOOGLE_CSE_CX):
-        return []
-    loc = location or DEFAULT_LOCATION
-    queries = []
+def _google_first_good_url(query: str) -> str | None:
+    links = _google_search(query, 5)
+    return _first_good_url(links)
 
-    # site-scoped first if we know the domain
-    if domain_for_site:
-        queries += [
-            f'site:{domain_for_site} "@{domain_for_site}"',
-            f"site:{domain_for_site} contact",
-            f"site:{domain_for_site} email",
-            f'site:{domain_for_site} "contact us"',
-            f"site:{domain_for_site} privacy",
-        ]
+def find_official_site(company: str, domain_hint: str | None = None) -> str | None:
+    """
+    Use Google CSE to find the official site. Returns URL or None.
+    """
+    # Prefer domain already on the row if present and sane
+    if domain_hint:
+        try:
+            parsed = urlparse(domain_hint if domain_hint.startswith("http") else f"https://{domain_hint}")
+            if parsed.netloc and _host_ok(domain_hint):
+                return parsed.geturl()
+        except Exception:
+            pass
 
-    # general with locality
-    queries += [
-        f"{company} {loc} email",
-        f"{company} {loc} contact",
-        f"{company} email address",
-        f"{company} contact details",
+    # Try a couple of queries that usually work well
+    queries = [
+        f"{company} official site",
+        f"{company} website",
+        f"{company} {DEFAULT_LOCATION} website",
     ]
 
-    urls = []
     for q in queries:
-        items = _google_search(q, 5)
-        for it in items:
-            url = (it.get("link") or "").strip()
-            if url and looks_like_candidate(url):
-                urls.append(url)
-            if len(urls) >= limit:
-                return dedupe(urls)
-    return dedupe(urls)
+        url = _google_first_good_url(q)
+        if url:
+            logging.info(f"[{company}] Google resolved: {url}")
+            return url
 
-# ---- helpers ----
-
-def _google_first_good_url(query):
-    items = _google_search(query, 5)
-    for it in items:
-        url = it.get("link") or it.get("formattedUrl") or ""
-        if looks_like_official(url):
-            return normalize_site(url)
-    return None  # don't pick a random bad host
-
-def _google_search(query, num=5):
-    params = {"key": GOOGLE_CSE_KEY, "cx": GOOGLE_CSE_CX, "q": query, "num": num, "safe": "off"}
-    r = requests.get(GOOGLE_ENDPOINT, params=params, timeout=20)
-    r.raise_for_status()
-    return (r.json() or {}).get("items", []) or []
-
-def looks_like_official(url):
-    u = (url or "").lower()
-    return bool(u) and not any(b in u for b in BAD_HOSTS)
-
-def looks_like_candidate(url):
-    u = (url or "").lower()
-    if not u or any(b in u for b in BAD_HOSTS):
-        return False
-    # Anything on the same site or typical contact pages
-    return any(x in u for x in ["contact", "about", "privacy", "impressum", "imprint", "@"])
-
-def normalize_site(url):
-    ext = tldextract.extract(url or "")
-    if not ext.registered_domain:
-        return None
-    return f"https://{ext.registered_domain}"
-
-def dedupe(seq):
-    out, seen = [], set()
-    for x in seq:
-        if x not in seen:
-            out.append(x); seen.add(x)
-    return out
+    logging.info(f"[{company}] No search provider result.")
+    return None
