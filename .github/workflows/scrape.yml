@@ -1,103 +1,58 @@
-name: Scrape Contacts (7am London)
+name: Scrape Contacts
 
 on:
-  workflow_dispatch:
-    inputs:
-      env:
-        description: "Environment (city) to run"
-        required: false
-        type: choice
-        # Add/remove cities you have environments for:
-        options: [Littleport]
-        default: Littleport
-
   schedule:
-    # GitHub cron is UTC. Run at 06:00 and 07:00 UTC.
-    # A guard below will only proceed if it's 07:00 in Europe/London.
-    - cron: "0 6 * * *"
-    - cron: "0 7 * * *"
+    - cron: '10 7 * * *'   # 07:10 UTC every day
+  workflow_dispatch:
 
 jobs:
-  # Scheduled (and "no env chosen" manual) path — runs per environment/city.
-  scrape-matrix:
-    if: ${{ github.event_name == 'schedule' || github.event.inputs.env == '' }}
+  scrape:
+    name: Run daily scraper
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        # List all your cities/environments here when you replicate:
-        env: [Littleport]
-    environment: ${{ matrix.env }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    concurrency:
+      group: scrape-contacts
+      cancel-in-progress: false
 
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Check current time in London is 07:00
-        id: london_now
-        run: |
-          echo "Now (Europe/London): $(TZ=Europe/London date)"
-          HOUR=$(TZ=Europe/London date +%H)
-          if [ "$HOUR" = "07" ]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "run=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Set up Python
-        if: steps.london_now.outputs.run == 'true'
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Install deps
-        if: steps.london_now.outputs.run == 'true'
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-
-      - name: Run scraper (${{ matrix.env }})
-        if: steps.london_now.outputs.run == 'true'
-        env:
-          GOOGLE_SA_JSON_B64: ${{ secrets.GOOGLE_SA_JSON_B64 }}
-          SHEET_ID:           ${{ secrets.SHEET_ID }}
-          SHEET_TAB:          ${{ secrets.SHEET_TAB }}
-          DEFAULT_LOCATION:   ${{ secrets.DEFAULT_LOCATION }}
-          MAX_ROWS:           ${{ secrets.MAX_ROWS }}
-          GOOGLE_CSE_KEY:     ${{ secrets.GOOGLE_CSE_KEY }}
-          GOOGLE_CSE_CX:      ${{ secrets.GOOGLE_CSE_CX }}
-          # optional fallbacks:
-          BING_API_KEY:       ${{ secrets.BING_API_KEY }}
-          SCRAPERAPI_KEY:     ${{ secrets.SCRAPERAPI_KEY }}
-        run: python -m src.main
-
-  # Manual “Run workflow” with a specific env — runs immediately, any time.
-  scrape-single:
-    if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.env != '' }}
-    runs-on: ubuntu-latest
-    environment: ${{ github.event.inputs.env }}
-
-    steps:
-      - uses: actions/checkout@v4
+      - name: Check out repository
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
+          cache: 'pip'
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Run scraper (${{ github.event.inputs.env }})
+      - name: Run scraper
         env:
-          GOOGLE_SA_JSON_B64: ${{ secrets.GOOGLE_SA_JSON_B64 }}
-          SHEET_ID:           ${{ secrets.SHEET_ID }}
-          SHEET_TAB:          ${{ secrets.SHEET_TAB }}
-          DEFAULT_LOCATION:   ${{ secrets.DEFAULT_LOCATION }}
-          MAX_ROWS:           ${{ secrets.MAX_ROWS }}
-          GOOGLE_CSE_KEY:     ${{ secrets.GOOGLE_CSE_KEY }}
-          GOOGLE_CSE_CX:      ${{ secrets.GOOGLE_CSE_CX }}
-          BING_API_KEY:       ${{ secrets.BING_API_KEY }}
-          SCRAPERAPI_KEY:     ${{ secrets.SCRAPERAPI_KEY }}
+          PYTHONUNBUFFERED: '1'
+
+          # Required
+          GOOGLE_SA_JSON_B64:             ${{ secrets.GOOGLE_SA_JSON_B64 }}
+          SHEET_ID:                       ${{ secrets.SHEET_ID }}
+
+          # Safe defaults so blanks don't crash
+          SHEET_TAB:                      ${{ secrets.SHEET_TAB || 'Sheet1' }}
+          DEFAULT_LOCATION:               ${{ secrets.DEFAULT_LOCATION || 'Ely' }}
+          MAX_ROWS:                       ${{ secrets.MAX_ROWS || '100' }}
+
+          # Google Programmable Search (CSE)
+          GOOGLE_CSE_KEY:                 ${{ secrets.GOOGLE_CSE_KEY }}
+          GOOGLE_CSE_CX:                  ${{ secrets.GOOGLE_CSE_CX }}
+
+          # Backoff to reduce transient 429s
+          GOOGLE_CSE_QPS_DELAY_MS:        ${{ secrets.GOOGLE_CSE_QPS_DELAY_MS || '800' }}
+          GOOGLE_CSE_MAX_RETRIES:         ${{ secrets.GOOGLE_CSE_MAX_RETRIES || '5' }}
+
+          # Optional fallbacks (leave empty if unused)
+          BING_API_KEY:                   ${{ secrets.BING_API_KEY || '' }}
+          SCRAPERAPI_KEY:                 ${{ secrets.SCRAPERAPI_KEY || '' }}
         run: python -m src.main
