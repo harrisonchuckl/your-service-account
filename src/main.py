@@ -1,4 +1,23 @@
-# src/main.py
+#!/usr/bin/env python3
+"""
+Main entrypoint for the scraper.
+- Opens the Google Sheet via service account credentials provided in GOOGLE_SA_JSON_B64.
+- Processes up to MAX_ROWS rows starting at the first unprocessed row.
+- For each company, tries to find the official site, then hunts for a public email or contact form.
+- NEVER guesses email addresses. If nothing is found, it leaves cells blank and moves on.
+
+Environment variables expected:
+  GOOGLE_SA_JSON_B64   (required)  – Base64 of your service account JSON (or raw JSON).
+  SHEET_ID             (required)  – Google Sheet ID (not URL).
+  SHEET_TAB            (optional)  – Worksheet/tab name (default "Sheet1").
+  DEFAULT_LOCATION     (optional)  – Used by some search fallbacks (default "Ely").
+  MAX_ROWS             (optional)  – Max rows to process per run (default "40").
+  GOOGLE_CSE_*         (optional)  – If your search module needs them, those are read in that module.
+
+This file is defensive: it wraps calls to optional functions in your submodules and falls back to simple
+logic so the workflow won’t crash if a function is missing or has a different signature.
+"""
+
 from __future__ import annotations
 
 import base64
@@ -6,432 +25,408 @@ import json
 import logging
 import os
 import re
+import sys
 import time
-from datetime import datetime, timezone
-from typing import Dict, List, Tuple, Optional, Set
-from urllib.parse import urljoin, urlparse
+from datetime import datetime
+from typing import Dict, List, Optional, Tuple
 
+import gspread
+
+# Optional helpers for light-weight crawling if your crawl module is unavailable for a specific call
 import requests
-import tldextract
 from bs4 import BeautifulSoup
 
-# ---- Logging ----
-logging.basicConfig(level=logging.INFO, format='[%(levelname)s] %(message)s')
-log = logging.getLogger("main")
+# Your project modules. We’ll feature-detect functions so mismatches won’t crash the run.
+try:
+    from . import search
+except Exception:  # pragma: no cover
+    search = None  # type: ignore
 
-# ---- Config (env-driven, no guessing) ----
-SHEET_ID = os.getenv("SHEET_ID", "")
-SHEET_TAB = os.getenv("SHEET_TAB", "Sheet1")
-MAX_ROWS = int(os.getenv("MAX_ROWS", "100"))
-DEFAULT_LOCATION = os.getenv("DEFAULT_LOCATION", "Ely")
+try:
+    from . import crawl
+except Exception:  # pragma: no cover
+    crawl = None  # type: ignore
 
-GOOGLE_CSE_KEY = os.getenv("GOOGLE_CSE_KEY", "")
-GOOGLE_CSE_CX = os.getenv("GOOGLE_CSE_CX", "")
-GOOGLE_QPS_DELAY = int(os.getenv("GOOGLE_CSE_QPS_DELAY_MS", "600")) / 1000.0
-GOOGLE_MAX_RETRIES = int(os.getenv("GOOGLE_CSE_MAX_RETRIES", "4"))
+try:
+    from . import extract
+except Exception:  # pragma: no cover
+    extract = None  # type: ignore
 
-HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "15"))
-MAX_PAGES_PER_SITE = int(os.getenv("MAX_PAGES_PER_SITE", "15"))
-MIN_PAGES_BEFORE_FALLBACK = int(os.getenv("MIN_PAGES_BEFORE_FALLBACK", "5"))
-ALLOW_GUESS = os.getenv("ALLOW_GUESS", "false").lower() == "true"  # we will not guess if false
-PREFER_COMPANY_DOMAIN = os.getenv("PREFER_COMPANY_DOMAIN", "true").lower() == "true"
+# ------------ Logging ------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(levelname)s:%(name)s:%(message)s",
+)
+LOG = logging.getLogger("main")
 
-BAD_HOSTS = set([
-    "facebook.com", "linkedin.com", "twitter.com", "x.com", "instagram.com", "youtube.com",
-    "wikipedia.org", "reddit.com", "medium.com", "blogspot.com", "wordpress.com",
-    "typepad.com", "pinterest.com", "foursquare.com", "yelp.com", "fda.gov", "amazon.com", "opentable.com",
-])
 
-HEADERS = {
-    "User-Agent": os.getenv(
-        "USER_AGENT",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
-    )
-}
+# ------------ Robust SA secret handling ------------
+def b64_to_json(s: str) -> dict:
+    """
+    Accepts:
+      - Proper Base64 (with or without padding/newlines)
+      - URL-safe Base64
+      - Raw JSON
+      - 'data:application/json;base64,<...>' strings
+    Returns parsed dict.
+    """
+    s = (s or "").strip()
+    if not s:
+        raise RuntimeError("GOOGLE_SA_JSON_B64 is empty")
 
-# ---- Utilities ----
-def registrable_domain(url_or_host: str) -> str:
-    if not url_or_host:
-        return ""
-    host = url_or_host
-    if "://" in url_or_host:
-        host = urlparse(url_or_host).netloc
-    ext = tldextract.extract(host)
-    if not ext.domain:
-        return host.lower()
-    return f"{ext.domain}.{ext.suffix}".lower() if ext.suffix else ext.domain.lower()
+    # Raw JSON?
+    if s.startswith("{") and s.endswith("}"):
+        return json.loads(s)
 
-def same_reg_domain(a: str, b: str) -> bool:
-    ra, rb = registrable_domain(a), registrable_domain(b)
-    return bool(ra and rb and ra == rb)
+    # data URL variant?
+    if "base64" in s[:60] and "," in s:
+        s = s.split(",", 1)[1]
 
-def b64_to_json(b64: str) -> dict:
-    data = base64.b64decode(b64).decode("utf-8")
-    return json.loads(data)
+    # Normalize: strip whitespace and fix padding
+    s = re.sub(r"\s+", "", s)
+    # Try standard b64 with padding fix
+    try:
+        pad = (-len(s)) % 4
+        if pad:
+            s += "=" * pad
+        data = base64.b64decode(s)
+        return json.loads(data.decode("utf-8"))
+    except Exception:
+        # Try URL-safe variant
+        data = base64.urlsafe_b64decode(s + "=" * ((4 - len(s) % 4) % 4))
+        return json.loads(data.decode("utf-8"))
 
-def open_sheet(sheet_id: str, tab_name: str):
-    import gspread  # lazy import
+
+# ------------ Google Sheets helpers ------------
+def open_sheet(sheet_id: str, sheet_tab: str) -> gspread.Worksheet:
     sa_b64 = os.getenv("GOOGLE_SA_JSON_B64", "")
-    if not sa_b64:
-        raise RuntimeError("GOOGLE_SA_JSON_B64 is not set")
-    creds = b64_to_json(sa_b64)
-    client = gspread.service_account_from_dict(creds)
-    sh = client.open_by_key(sheet_id)
-    ws = sh.worksheet(tab_name)
-    return ws
+    creds_dict = b64_to_json(sa_b64)
+    gc = gspread.service_account_from_dict(creds_dict)
+    sh = gc.open_by_key(sheet_id)
+    return sh.worksheet(sheet_tab)
 
-def get_table(ws) -> Tuple[List[str], List[List[str]]]:
-    values = ws.get_all_values()
-    if not values:
-        return [], []
-    headers = values[0]
-    rows = values[1:]
-    return headers, rows
 
-def header_map(headers: List[str]) -> Dict[str, int]:
-    return {h.strip(): i for i, h in enumerate(headers)}
+def header_map(ws: gspread.Worksheet) -> Dict[str, int]:
+    headers = ws.row_values(1)
+    return {h.strip(): idx + 1 for idx, h in enumerate(headers) if h.strip()}
 
-def find_first_unprocessed(headers: List[str], rows: List[List[str]]) -> int:
-    h = header_map(headers)
-    idx_email = h.get("ContactEmail")
-    idx_form = h.get("ContactFormURL")
-    idx_status = h.get("Status")
-    for i, row in enumerate(rows, start=2):  # sheet rows start at 2 for first data row
-        email = row[idx_email] if idx_email is not None and idx_email < len(row) else ""
-        form = row[idx_form] if idx_form is not None and idx_form < len(row) else ""
-        status = row[idx_status] if idx_status is not None and idx_status < len(row) else ""
-        if not email and not form and status != "done":
-            return i
+
+def find_start_row(ws: gspread.Worksheet, H: Dict[str, int]) -> int:
+    """
+    Heuristic: first row where Status is blank (or not 'Done') AND (ContactEmail and ContactFormURL are blank).
+    Falls back to the first row after header if these headers don’t exist.
+    """
+    max_rows = ws.row_count or 1000
+    status_col = H.get("Status")
+    email_col = H.get("ContactEmail")
+    form_col = H.get("ContactFormURL")
+
+    # Always start from 2 (data starts below header)
+    for r in range(2, max_rows + 1):
+        row_vals = ws.row_values(r)
+        # If entire row is empty, skip
+        if not any(v.strip() for v in row_vals):
+            continue
+
+        status_ok = True
+        if status_col:
+            status_val = row_vals[status_col - 1].strip() if len(row_vals) >= status_col else ""
+            status_ok = (status_val == "") or (status_val.lower() not in {"done", "skip"})
+
+        email_blank = True
+        form_blank = True
+        if email_col:
+            email_val = row_vals[email_col - 1].strip() if len(row_vals) >= email_col else ""
+            email_blank = (email_val == "")
+        if form_col:
+            form_val = row_vals[form_col - 1].strip() if len(row_vals) >= form_col else ""
+            form_blank = (form_val == "")
+
+        if status_ok and email_blank and form_blank:
+            return r
+
     return 2
 
-# ---- Fetch & crawl ----
-def fetch(url: str) -> Optional[str]:
-    try:
-        r = requests.get(url, headers=HEADERS, timeout=HTTP_TIMEOUT, allow_redirects=True)
-        if r.status_code >= 400:
-            return None
-        ct = (r.headers.get("content-type") or "").lower()
-        if "text/html" not in ct and "application/xhtml" not in ct and "<html" not in r.text.lower():
-            return None
-        return r.text
-    except Exception:
-        return None
 
-def candidate_links(base_url: str, html: str) -> List[str]:
-    soup = BeautifulSoup(html, "html.parser")
-    links = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        u = urljoin(base_url, href)
-        links.append(u)
-    # Filter to same site and contact-like
-    base_host = registrable_domain(base_url)
-    out = []
-    for u in links:
-        if not same_reg_domain(u, base_host):
-            continue
-        lu = u.lower()
-        if any(x in lu for x in ["/contact", "contact-", "contactus", "contact-us", "get-in-touch", "getintouch",
-                                  "/about", "/impressum", "/kontakt", "/find-us", "/where-to-find-us", "/support", "/help"]):
-            out.append(u)
-    # dedupe
-    seen = set()
-    uniq = []
-    for u in out:
-        if u not in seen:
-            seen.add(u)
-            uniq.append(u)
-    return uniq[:MAX_PAGES_PER_SITE]
+def set_cell(ws: gspread.Worksheet, row: int, col: Optional[int], value: Optional[str]) -> None:
+    if col and value is not None:
+        try:
+            ws.update_cell(row, col, value)
+        except Exception as e:
+            LOG.warning(f"Cell update failed (row {row}, col {col}): {e}")
+
+
+def now_iso() -> str:
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+
+# ------------ Lightweight crawling & extraction fallbacks ------------
+DEFAULT_CONTACT_PATHS = [
+    "contact", "contact-us", "contacts", "contactus", "get-in-touch", "getintouch",
+    "about", "team", "imprint", "impressum", "legal", "support", "help",
+]
 
 EMAIL_RE = re.compile(r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", re.I)
-MAILTO_RE = re.compile(r"mailto:([^\s\"'>?#]+)", re.I)
 
-def extract_emails_and_forms(url: str, html: str) -> Tuple[Set[str], bool]:
-    emails: Set[str] = set()
-    if isinstance(html, str):
-        for m in MAILTO_RE.findall(html or ""):
-            e = m.split("?")[0].strip()
-            if e:
-                emails.add(e)
-        soup = BeautifulSoup(html, "html.parser")
-        txt = soup.get_text(" ", strip=True)
-        for m in EMAIL_RE.findall(txt):
-            emails.add(m.strip())
-        # simple contact form heuristic
-        has_form = False
-        for f in soup.find_all("form"):
-            blob = " ".join([f.get("id") or "", " ".join(f.get("class") or [])]).lower()
-            inputs = f.find_all(["input", "textarea", "select"])
-            names = " ".join((i.get("name") or "") for i in inputs).lower()
-            placeholders = " ".join((i.get("placeholder") or "") for i in inputs).lower()
-            labels = " ".join(l.get_text(" ", strip=True).lower() for l in f.find_all("label"))
-            alltxt = f"{blob} {names} {placeholders} {labels}"
-            if any(k in alltxt for k in ["contact", "enquiry", "inquiry", "message", "support", "help", "email"]):
-                has_form = True
-                break
-        # Count explicit contact-like URLs as forms
-        if not has_form:
-            u = (url or "").lower()
-            if "contact" in u or "get-in-touch" in u or "kontakt" in u or "impressum" in u:
-                has_form = True
-        return emails, has_form
-    return set(), False
 
-def find_official_site(company: str, domain_hint: str = "") -> Optional[str]:
-    # If a plausible website is already in hint, use it
-    if domain_hint and "." in domain_hint and "/" not in domain_hint:
-        return f"https://{domain_hint.strip().lower()}"
-    # Use Google CSE
-    if not GOOGLE_CSE_KEY or not GOOGLE_CSE_CX:
-        return None
-    queries = [
-        f"{company} official site",
-        f"{company} {DEFAULT_LOCATION} official site",
-        f"{company} website",
-    ]
-    if domain_hint:
-        queries.insert(0, f"{company} {domain_hint} official site")
-    seen = set()
-    for q in queries:
-        for attempt in range(GOOGLE_MAX_RETRIES):
-            try:
-                resp = requests.get(
-                    "https://www.googleapis.com/customsearch/v1",
-                    params={"key": GOOGLE_CSE_KEY, "cx": GOOGLE_CSE_CX, "q": q, "num": 5, "safe": "off"},
-                    timeout=HTTP_TIMEOUT,
-                )
-                if resp.status_code == 429:
-                    time.sleep(1.5 * (attempt + 1))
-                    continue
-                resp.raise_for_status()
-                data = resp.json()
-                items = data.get("items", []) or []
-                for it in items:
-                    link = it.get("link", "")
-                    if not link or link in seen:
-                        continue
-                    seen.add(link)
-                    host = registrable_domain(link)
-                    if host in BAD_HOSTS:
-                        continue
-                    # prefer company or hint in domain
-                    if company.lower().split()[0] in host or (domain_hint and domain_hint.split(".")[0] in host):
-                        return link
-                break
-            except Exception:
-                pass
-            finally:
-                time.sleep(GOOGLE_QPS_DELAY)
-    # fallback: first item not in BAD_HOSTS
-    for q in queries:
-        try:
-            resp = requests.get(
-                "https://www.googleapis.com/customsearch/v1",
-                params={"key": GOOGLE_CSE_KEY, "cx": GOOGLE_CSE_CX, "q": q, "num": 5, "safe": "off"},
-                timeout=HTTP_TIMEOUT,
-            )
-            data = resp.json()
-            for it in data.get("items", []) or []:
-                link = it.get("link", "")
-                if link and registrable_domain(link) not in BAD_HOSTS:
-                    return link
-        except Exception:
-            pass
-        finally:
-            time.sleep(GOOGLE_QPS_DELAY)
+def safe_fetch(url: str, timeout: int = 15) -> Optional[str]:
+    try:
+        r = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0"})
+        if r.status_code >= 200 and r.status_code < 300:
+            return r.text
+    except Exception:
+        pass
     return None
 
-def google_contact_hunt(site_url: str) -> Tuple[Set[str], Optional[str], Dict[str, str]]:
+
+def find_emails_in_html(html: str) -> List[str]:
+    if not html:
+        return []
+    found = set(EMAIL_RE.findall(html))
+    # Filter obvious junk like tracking placeholders
+    return sorted(e for e in found if "@" in e and not e.lower().startswith("noreply"))
+
+
+def discover_contact_pages(base_url: str) -> List[str]:
+    pages: List[str] = []
+    # Prefer calling your crawl module if it provides something richer
+    if crawl:
+        if hasattr(crawl, "crawl_candidate_pages"):
+            try:
+                pages = list(crawl.crawl_candidate_pages(base_url))  # type: ignore
+                return pages[:20]
+            except Exception:
+                pass
+        if hasattr(crawl, "crawl_site"):
+            try:
+                pages = list(crawl.crawl_site(base_url, max_pages=20))  # type: ignore
+                return pages[:20]
+            except Exception:
+                pass
+
+    # Fallback: just try a set of common contact paths
+    base = base_url.rstrip("/")
+    tried = {base}
+    cand = [f"{base}/{p.strip('/')}" for p in DEFAULT_CONTACT_PATHS]
+    out: List[str] = []
+    for u in cand:
+        if u in tried:
+            continue
+        tried.add(u)
+        out.append(u)
+    return out[:20]
+
+
+def extract_contacts_from_html(html: str, page_url: str) -> Tuple[List[str], bool]:
     """
-    Search Google for contact pages on the same domain, then fetch & extract.
-    Returns (emails, best_form_url, email_sources)
+    Returns (emails, has_contact_form)
+    Uses your extract module if available, else a simple BeautifulSoup scan.
     """
-    emails: Set[str] = set()
-    email_sources: Dict[str, str] = {}
-    best_form: Optional[str] = None
-    if not GOOGLE_CSE_KEY or not GOOGLE_CSE_CX or not site_url:
-        return emails, best_form, email_sources
-    dom = registrable_domain(site_url)
-    q_list = [
-        f"site:{dom} contact",
-        f"site:{dom} email",
-        f"site:{dom} get in touch",
-    ]
-    candidates: List[str] = []
-    seen = set()
-    for q in q_list:
+    if extract:
+        # Try calling with (html, base_url=...)
         try:
-            resp = requests.get(
-                "https://www.googleapis.com/customsearch/v1",
-                params={"key": GOOGLE_CSE_KEY, "cx": GOOGLE_CSE_CX, "q": q, "num": 5, "safe": "off"},
-                timeout=HTTP_TIMEOUT,
-            )
-            if resp.status_code == 429:
-                time.sleep(1.2)
-                continue
-            resp.raise_for_status()
-            data = resp.json()
-            for it in data.get("items", []) or []:
-                link = it.get("link", "")
-                if not link or link in seen:
-                    continue
-                seen.add(link)
-                if not same_reg_domain(link, dom):
-                    continue
-                if registrable_domain(link) in BAD_HOSTS:
-                    continue
-                candidates.append(link)
+            info = extract.extract_contacts(html, base_url=page_url)  # type: ignore
+            emails = sorted(set(info.get("emails", []) or []))
+            has_form = bool(info.get("has_form") or info.get("forms"))
+            return emails, has_form
+        except TypeError:
+            # Try simplest signature
+            try:
+                info = extract.extract_contacts(html)  # type: ignore
+                emails = sorted(set(info.get("emails", []) or []))
+                has_form = bool(info.get("has_form") or info.get("forms"))
+                return emails, has_form
+            except Exception:
+                pass
         except Exception:
             pass
-        finally:
-            time.sleep(GOOGLE_QPS_DELAY)
-    # fetch candidates
-    for url in candidates[:10]:
-        html = fetch(url)
+
+    # Fallback: basic soup scan
+    soup = BeautifulSoup(html or "", "html.parser")
+    # mailto links
+    emails = set()
+    for a in soup.find_all("a", href=True):
+        href = a["href"] or ""
+        if href.lower().startswith("mailto:"):
+            addr = href.split(":", 1)[1].split("?")[0].strip()
+            if addr:
+                emails.add(addr)
+    # plus regex in the page text
+    emails.update(find_emails_in_html(soup.get_text(" ")))
+    has_form = bool(soup.find("form"))
+    return sorted(emails), has_form
+
+
+# ------------ Official site resolution ------------
+def find_official_site(company: str, domain_hint: str = "") -> Optional[str]:
+    """
+    Try your search module first, then a simple heuristic.
+    """
+    if search:
+        if hasattr(search, "find_official_site"):
+            try:
+                return search.find_official_site(company, domain_hint)  # type: ignore
+            except Exception:
+                pass
+        # Older name?
+        if hasattr(search, "resolve_official_site"):
+            try:
+                return search.resolve_official_site(company, domain_hint)  # type: ignore
+            except Exception:
+                pass
+
+    # Very simple heuristic: if we have a plausible domain, use it; else None.
+    domain_hint = (domain_hint or "").strip()
+    if domain_hint and "." in domain_hint and " " not in domain_hint:
+        if not domain_hint.startswith("http"):
+            domain_hint = "https://" + domain_hint
+        return domain_hint
+    return None
+
+
+# ------------ Row processing ------------
+def process_one(ws: gspread.Worksheet, row_idx: int, H: Dict[str, int], default_location: str) -> None:
+    """
+    Process a single sheet row: attempt to find site, then public email or contact form.
+    Never guesses emails.
+    """
+    def val(col_name: str) -> str:
+        c = H.get(col_name)
+        if not c:
+            return ""
+        vals = ws.row_values(row_idx)
+        return vals[c - 1].strip() if len(vals) >= c else ""
+
+    company = val("Company")
+    domain_hint = val("Domain")
+    website_existing = val("Website")
+
+    if not company and not domain_hint:
+        return  # nothing to do
+
+    if website_existing:
+        homepage = website_existing
+    else:
+        homepage = find_official_site(company, domain_hint) or ""
+
+    if homepage:
+        LOG.info(f"[INFO] [{company}] Google resolved: {homepage}")
+        set_cell(ws, row_idx, H.get("Website"), homepage)
+
+    # Crawl candidate pages
+    emails_found: List[str] = []
+    form_url: Optional[str] = None
+    source_url: Optional[str] = None
+
+    candidates = []
+    if homepage:
+        candidates = [homepage] + discover_contact_pages(homepage)
+
+    # Try each candidate quickly; bail as soon as we find an email or a form
+    for url in candidates[:20]:
+        html = None
+
+        # Prefer your crawl module if it exposes fetch()
+        if crawl and hasattr(crawl, "fetch"):
+            try:
+                html = crawl.fetch(url)  # type: ignore
+                if isinstance(html, tuple):
+                    # some versions return (html, final_url)
+                    html = html[0]
+            except Exception:
+                html = None
+
+        if html is None:
+            html = safe_fetch(url)
+
         if not html:
             continue
-        found, has_form = extract_emails_and_forms(url, html)
-        for e in found:
-            emails.add(e)
-            if e not in email_sources:
-                email_sources[e] = url
-        if has_form and not best_form:
-            best_form = url
-        if emails and best_form:
-            break
-    return emails, best_form, email_sources
 
-# ---- Main run ----
-def run():
-    ws = open_sheet(SHEET_ID, SHEET_TAB)
-    headers, rows = get_table(ws)
-    if not headers:
-        log.error("No headers found")
-        return
-    h = header_map(headers)
-    idx_company = h.get("Company")
-    idx_domain  = h.get("Domain")
-    idx_website = h.get("Website")
-    idx_email   = h.get("ContactEmail")
-    idx_form    = h.get("ContactFormURL")
-    idx_source  = h.get("SourceURL")
-    idx_status  = h.get("Status")
-    idx_checked = h.get("LastChecked")
-    idx_notes   = h.get("Notes")
-    start_row = find_first_unprocessed(headers, rows)
-    log.info("Starting at first unprocessed row: %d", start_row-1)
+        emails, has_form = extract_contacts_from_html(html, url)
 
+        if emails and not emails_found:
+            emails_found = emails
+            source_url = url
+
+        if has_form and not form_url:
+            form_url = url
+
+        if emails_found and form_url:
+            break  # we’re good
+
+    # Update sheet WITHOUT guessing
+    if emails_found:
+        set_cell(ws, row_idx, H.get("ContactEmail"), ", ".join(emails_found))
+    if form_url:
+        set_cell(ws, row_idx, H.get("ContactFormURL"), form_url)
+    if source_url:
+        set_cell(ws, row_idx, H.get("SourceURL"), source_url)
+
+    status_msg = "Found" if (emails_found or form_url) else "No public contact"
+    set_cell(ws, row_idx, H.get("Status"), status_msg)
+    set_cell(ws, row_idx, H.get("LastChecked"), now_iso())
+
+
+# ------------ Runner ------------
+def run() -> None:
+    sheet_id = os.getenv("SHEET_ID", "").strip()
+    sheet_tab = os.getenv("SHEET_TAB", "Sheet1").strip()
+    default_location = os.getenv("DEFAULT_LOCATION", "Ely").strip()
+    max_rows = int(os.getenv("MAX_ROWS", "40") or "40")
+
+    if not sheet_id:
+        LOG.error("SHEET_ID is missing. Set it as a GitHub secret and pass it to the workflow env.")
+        sys.exit(1)
+
+    ws = open_sheet(sheet_id, sheet_tab)
+    H = header_map(ws)
+    start_row = find_start_row(ws, H)
+    LOG.info(f"Starting at first unprocessed row: {start_row}")
+
+    # Process up to max_rows rows
     processed = 0
-    for rownum in range(start_row, min(len(rows)+1, start_row - 1 + MAX_ROWS) + 1):
-        # Fetch fresh row values (in case of manual edits)
-        row_vals = ws.row_values(rownum)
-        # pad
-        if len(row_vals) < len(headers):
-            row_vals += [""] * (len(headers)-len(row_vals))
-        company = row_vals[idx_company] if idx_company is not None else ""
-        domain_hint = row_vals[idx_domain] if idx_domain is not None else ""
-        website = row_vals[idx_website] if idx_website is not None else ""
-        if not company:
+    row = start_row
+    # Stop when we reach the bottom or hit our batch limit
+    max_sheet_rows = ws.row_count or (start_row + max_rows + 10)
+
+    while processed < max_rows and row <= max_sheet_rows:
+        try:
+            vals = ws.row_values(row)
+        except Exception:
+            break
+
+        if not any(v.strip() for v in vals):
+            row += 1
             continue
-        print(f"[INFO] == {company} ==")
 
-        # 1) Find official site
-        if not website:
-            site = find_official_site(company, domain_hint)
-            if site:
-                website = site
-                if idx_website is not None:
-                    ws.update_cell(rownum, idx_website+1, website)
-                print(f"[INFO] [{company}] Google resolved: {website}")
-        else:
-            print(f"[INFO] [{company}] Using existing website: {website}")
+        try:
+            company = vals[H.get("Company", 1) - 1] if len(vals) >= H.get("Company", 1) else ""
+        except Exception:
+            company = ""
 
-        emails: Set[str] = set()
-        forms: List[str] = []
-        email_sources: Dict[str, str] = {}
+        if not company.strip():
+            row += 1
+            continue
 
-        # 2) Crawl homepage and contact-like pages
-        if website:
-            home_html = fetch(website)
-            cand = []
-            if home_html:
-                cand = candidate_links(website, home_html)
-                # include homepage itself for email scraping
-                cand = [website] + cand
-            else:
-                cand = [website]
-            seen_pages = set()
-            for url in cand[:MAX_PAGES_PER_SITE]:
-                if url in seen_pages:
-                    continue
-                seen_pages.add(url)
-                html = home_html if url == website and home_html else fetch(url)
-                if not html:
-                    continue
-                found, has_form = extract_emails_and_forms(url, html)
-                # Prefer company domain emails
-                for e in found:
-                    if not PREFER_COMPANY_DOMAIN or same_reg_domain(e.split("@")[-1], website):
-                        emails.add(e)
-                        if e not in email_sources:
-                            email_sources[e] = url
-                if has_form:
-                    forms.append(url)
+        LOG.info(f"== {company.strip()} ==")
+        t0 = time.time()
+        try:
+            process_one(ws, row, H, default_location)
+        except Exception as e:
+            LOG.info(f"Site crawl error: {e}")
+            # Mark attempt time anyway
+            set_cell(ws, row, H.get("LastChecked"), now_iso())
+            set_cell(ws, row, H.get("Status"), f"Error: {type(e).__name__}")
+        finally:
+            processed += 1
+            # Small polite delay between companies (helps rate limits)
+            elapsed = time.time() - t0
+            if elapsed < 1.0:
+                time.sleep(1.0 - elapsed)
 
-        # 3) If still nothing, try Google contact hunt on same domain
-        if not emails and not forms and website:
-            print("[INFO] No email/form on site pages, trying Google contact hunt…")
-            ge, gf, es = google_contact_hunt(website)
-            emails |= ge
-            email_sources.update(es)
-            if gf:
-                forms.append(gf)
+        row += 1
 
-        # 4) Decide outcome — NEVER GUESS if ALLOW_GUESS is False
-        status = ""
-        notes = ""
-        best_email = next(iter(emails)) if emails else ""
-        best_form = forms[0] if forms else ""
-
-        if best_email:
-            status = "email_found"
-            if idx_email is not None:
-                ws.update_cell(rownum, idx_email+1, best_email)
-            if idx_source is not None and best_email in email_sources:
-                ws.update_cell(rownum, idx_source+1, email_sources[best_email])
-            notes = f"Found {len(emails)} email(s)"
-        elif best_form:
-            status = "form_found"
-            if idx_form is not None:
-                ws.update_cell(rownum, idx_form+1, best_form)
-            notes = "No email found; contact form available"
-        else:
-            if ALLOW_GUESS:
-                # we still log but do not set guessed email; safer default
-                dom = registrable_domain(website or domain_hint)
-                print(f"[INFO] ⚠ No public email or form; ALLOW_GUESS=true but skipping setting guessed email info@{dom}")
-                status = "no_contact"
-                notes = "Would guess, but safe-mode skip"
-            else:
-                print("[INFO] ⚠ No public email or form; NOT guessing (skipped)")
-                status = "no_contact"
-                notes = "No email/form; guessing disabled"
-
-        # 5) Write status + timestamp
-        now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z")
-        if idx_status is not None:
-            ws.update_cell(rownum, idx_status+1, status)
-        if idx_checked is not None:
-            ws.update_cell(rownum, idx_checked+1, now)
-        if idx_notes is not None:
-            ws.update_cell(rownum, idx_notes+1, notes)
-
-        processed += 1
-        # gentle pacing to respect APIs
-        time.sleep(0.5)
-
-    log.info("Processed %d row(s).", processed)
+    LOG.info("Done.")
 
 
 if __name__ == "__main__":
