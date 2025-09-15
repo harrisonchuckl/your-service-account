@@ -1,50 +1,58 @@
 # src/config.py
 import os
 
-def _int(name: str, default: int) -> int:
-    val = os.getenv(name)
-    if val is None:
+def _get(name: str, default: str = "") -> str:
+    v = os.getenv(name)
+    if v is None:
         return default
-    val = str(val).strip()
+    v = str(v).strip()
+    return v if v != "" else default
+
+def _getint(name: str, default: int) -> int:
+    v = os.getenv(name)
     try:
-        return int(val)
+        s = ("" if v is None else str(v).strip())
+        return int(s) if s != "" else default
     except Exception:
         return default
 
-def _str(name: str, default: str) -> str:
-    val = os.getenv(name)
-    if val is None:
-        return default
-    val = str(val).strip()
-    return val or default
+# === Google Sheets auth ===
+GOOGLE_SA_JSON_B64 = _get("GOOGLE_SA_JSON_B64")    # required
+SHEET_ID            = _get("SHEET_ID")             # required
+SHEET_TAB           = _get("SHEET_TAB", "Sheet1")
 
-# ===== Public config used by other modules =====
-DEFAULT_LOCATION = _str("DEFAULT_LOCATION", "Ely")
+# === Scraper behavior ===
+DEFAULT_LOCATION    = _get("DEFAULT_LOCATION", "Ely")
+MAX_ROWS            = _getint("MAX_ROWS", 100)
+HTTP_TIMEOUT        = _getint("HTTP_TIMEOUT", 15)
+MAX_PAGES_PER_SITE  = _getint("MAX_PAGES_PER_SITE", 20)
 
-# How many sheet rows to process per run
-MAX_ROWS = _int("MAX_ROWS", 40)
+# User-Agent used by requests
+USER_AGENT = _get(
+    "USER_AGENT",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
 
-# Crawl tuning
-CRAWL_MAX_PAGES_PER_SITE = _int("CRAWL_MAX_PAGES_PER_SITE", 20)
-CRAWL_TIMEOUT_SECS       = _int("CRAWL_TIMEOUT_SECS", 12)
+# === Google Programmable Search (CSE) ===
+GOOGLE_CSE_KEY             = _get("GOOGLE_CSE_KEY")   # your API key
+GOOGLE_CSE_CX              = _get("GOOGLE_CSE_CX")    # your search engine ID
+GOOGLE_CSE_QPS_DELAY_MS    = _getint("GOOGLE_CSE_QPS_DELAY_MS", 800)
+GOOGLE_CSE_MAX_RETRIES     = _getint("GOOGLE_CSE_MAX_RETRIES", 5)
 
-# Google Custom Search (CSE)
-GOOGLE_CSE_KEY           = _str("GOOGLE_CSE_KEY", "")
-GOOGLE_CSE_CX            = _str("GOOGLE_CSE_CX", "")
-GOOGLE_CSE_QPS_DELAY_MS  = _int("GOOGLE_CSE_QPS_DELAY_MS", 500)  # 0.5s between calls
-GOOGLE_CSE_MAX_RETRIES   = _int("GOOGLE_CSE_MAX_RETRIES", 4)     # backoff attempts
+# === Optional fallbacks / proxies ===
+BING_API_KEY    = _get("BING_API_KEY", "")
+SCRAPERAPI_KEY  = _get("SCRAPERAPI_KEY", "")   # define this even if empty
 
-# Known “bad” hosts we don’t want as company sites
+# Hosts we don’t want to treat as “official websites”
 BAD_HOSTS = {
-    "facebook.com", "www.facebook.com",
-    "twitter.com", "x.com", "www.twitter.com", "www.x.com",
-    "linkedin.com", "www.linkedin.com",
-    "instagram.com", "www.instagram.com",
-    "youtube.com", "www.youtube.com",
-    "yelp.com", "www.yelp.com",
-    "uk.linkedin.com", "en-gb.facebook.com",
-    "m.facebook.com", "mobile.twitter.com",
+    "facebook.com",
+    "m.facebook.com",
+    "instagram.com",
+    "twitter.com",
+    "x.com",
+    "linkedin.com",
+    "youtube.com",
+    "yelp.com",
+    "wikipedia.org",
 }
-
-# Sheet tab default (still overridable via env)
-SHEET_TAB = _str("SHEET_TAB", "Sheet1")
