@@ -79,7 +79,6 @@ BING_API_KEY              = _getenv("BING_API_KEY", "")
 MAX_GOOGLE_CANDIDATES     = _getint("MAX_GOOGLE_CANDIDATES", 6)
 
 # Skip sending us to generic/low-signal destinations in search results
-# You can also override/extend via env BAD_HOSTS="facebook.com,linkedin.com,..."
 BAD_HOSTS: List[str] = _getlist(
     "BAD_HOSTS",
     [
@@ -106,10 +105,11 @@ GENERIC_GUESS_PREFIXES   = _getlist(
 )
 
 # -----------------------------
-# Sheet-related (for reference; typically provided via secrets/env)
+# Sheets / Service Account
 # -----------------------------
 SHEET_ID                 = _getenv("SHEET_ID", None)
 SHEET_TAB                = _getenv("SHEET_TAB", "Sheet1")
+GOOGLE_SA_JSON_B64       = _getenv("GOOGLE_SA_JSON_B64", "")  # <- added
 
 # -----------------------------
 # Export convenience
@@ -122,5 +122,5 @@ __all__ = [
     "BING_API_KEY", "MAX_GOOGLE_CANDIDATES", "BAD_HOSTS",
     "DEFAULT_LOCATION", "MAX_ROWS",
     "PREFER_COMPANY_DOMAIN", "GUESS_GENERICS", "GENERIC_GUESS_PREFIXES",
-    "SHEET_ID", "SHEET_TAB",
+    "SHEET_ID", "SHEET_TAB", "GOOGLE_SA_JSON_B64",
 ]
