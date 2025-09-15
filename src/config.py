@@ -37,23 +37,25 @@ MAX_GOOGLE_CANDIDATES    = _getint("MAX_GOOGLE_CANDIDATES", "6")
 # ---------------------------
 # HTTP / crawling
 # ---------------------------
-HTTP_TIMEOUT     = _getint("HTTP_TIMEOUT", "20")   # seconds
-TIMEOUT          = HTTP_TIMEOUT                    # legacy alias
-FETCH_DELAY_MS   = _getint("FETCH_DELAY_MS", "300")
-FETCH_MAX_PAGES  = _getint("FETCH_MAX_PAGES", "40")
+HTTP_TIMEOUT      = _getint("HTTP_TIMEOUT", "20")   # seconds
+TIMEOUT           = HTTP_TIMEOUT                    # legacy alias
+FETCH_DELAY_MS    = _getint("FETCH_DELAY_MS", "300")
+FETCH_MAX_PAGES   = _getint("FETCH_MAX_PAGES", "40")
 MAX_CONTACT_PAGES = _getint("MAX_CONTACT_PAGES", "20")
 
 # Optional proxy / rendering
-SCRAPERAPI_KEY    = _get("SCRAPERAPI_KEY", "")
-SCRAPERAPI_BASE   = _get("SCRAPERAPI_BASE", "https://api.scraperapi.com/")
-SCRAPERAPI_RENDER = _getbool("SCRAPERAPI_RENDER", "false")
+SCRAPERAPI_KEY     = _get("SCRAPERAPI_KEY", "")
+SCRAPERAPI_BASE    = _get("SCRAPERAPI_BASE", "https://api.scraperapi.com/")
+SCRAPERAPI_RENDER  = _getbool("SCRAPERAPI_RENDER", "false")
+# Country code for ScraperAPI (e.g. 'uk', 'us'); blank means don't force geo
+SCRAPERAPI_COUNTRY = _get("SCRAPERAPI_COUNTRY", "").lower()
 
 # ---------------------------
 # Heuristics & preferences
 # ---------------------------
 PREFER_COMPANY_DOMAIN = _getbool("PREFER_COMPANY_DOMAIN", "true")
 
-# Turn on ONLY if you want to guess info@ / hello@, etc.
+# Enable to guess info@ / hello@ etc if nothing found
 GUESS_GENERICS = _getbool("GUESS_GENERICS", "false")
 _DEFAULT_GUESS_PREFIXES: List[str] = [
     "info", "hello", "contact", "sales", "enquiries", "enquiry", "admin"
@@ -86,12 +88,11 @@ BAD_HOSTS: List[str] = [
 # ---------------------------
 # Headers / UA
 # ---------------------------
-USER_AGENT = _get("USER_AGENT", "Mozilla/5.0 (compatible; ChucklScraper/1.0; +https://example.com/bot)")
+USER_AGENT = _get("USER_AGENT", "Mozilla/5.0 (compatible; ChucklScraper/1.0)")
 HEADERS = {"User-Agent": USER_AGENT}
 
 # ---------------------------
 # Backward-compat aliases
 # ---------------------------
-# Some modules import these legacy names:
 MAX_PAGES_PER_SITE = FETCH_MAX_PAGES
 REQUEST_HEADERS    = HEADERS
